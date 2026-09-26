@@ -40,3 +40,28 @@
   {{end}}
 </div>
 {{end}}
+
+{{/*
+  Tombol saran pertanyaan lanjutan, disusun model dari pertanyaan dan konteks
+  pasal yang terambil.
+
+  Pertanyaan dikirim lewat query string, bukan hx-vals berisi JSON. Saran
+  berasal dari model dan bisa memuat tanda kutip: html/template meng-escape
+  kutip jadi &#34;, browser meng-decode-nya kembali jadi kutip, dan JSON di
+  hx-vals jadi tidak sah. Pola query string sudah dipakai koneksi SSE di
+  tanya.html dan handleTanya.
+
+  Tombolnya meniru tombol pertanyaan contoh di index.html: menambahkan kartu
+  pertanyaan baru ke #log, bukan menggantinya.
+*/}}
+{{define "saran"}}
+<div class="not-prose mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-3">
+  <span class="text-xs text-slate-400">Lanjutkan:</span>
+  {{range .}}<button type="button"
+      hx-get="/tanya?q={{.URL}}"
+      hx-target="#log" hx-swap="beforeend show:bottom"
+      hx-indicator="#memuat" hx-disabled-elt="this"
+      class="rounded-full border border-slate-300 bg-white px-3 py-1 text-xs text-slate-600 shadow-sm transition hover:border-sky-400 hover:text-sky-700 disabled:opacity-50">{{.Teks}}</button>
+  {{end}}
+</div>
+{{end}}

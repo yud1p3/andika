@@ -43,4 +43,14 @@
     mengirim event sama sekali kalau tidak ada yang bisa dirujuk.
   */}}
   <div sse-swap="sumber" hx-swap="innerHTML"></div>
+
+  {{/*
+    Wadah tombol saran pertanyaan lanjutan, di bawah blok rujukan.
+
+    Event "saran" datang paling akhir — setelah jawaban selesai — karena saran
+    disusun model kedua yang berjalan bersamaan dengan jawaban. Sama seperti
+    rujukan, elemen ini kosong dan tanpa gaya sampai ada isinya; server tidak
+    mengirim event sama sekali kalau tidak ada saran.
+  */}}
+  <div sse-swap="saran" hx-swap="innerHTML"></div>
 </article>

@@ -25,9 +25,10 @@ import (
 // penulisan ulang pertanyaan dari panggilan penyusun jawaban.
 //
 // Panggilan yang pesan pertamanya berisi condenseInstruction diperlakukan
-// sebagai panggilan penulisan ulang dan dibalas condenseReply; panggilan lain
-// dibalas generateReply. Kalau chunks diisi, Stream mengembalikannya sebagai
-// aliran terpisah satu per satu.
+// sebagai panggilan penulisan ulang dan dibalas condenseReply; panggilan yang
+// pesan pertamanya berawalan saranInstructionAwal dibalas saranReply;
+// panggilan lain dibalas generateReply. Kalau chunks diisi, Stream
+// mengembalikannya sebagai aliran terpisah satu per satu.
 type fakeChatModel struct {
 	chunks []string
 
@@ -36,6 +37,9 @@ type fakeChatModel struct {
 
 	generateReply string
 	generateErr   error
+
+	saranReply string
+	saranErr   error
 
 	// panggilan mencatat seluruh pesan yang diterima Generate, terurut waktu.
 	panggilan [][]*schema.Message
@@ -49,6 +53,15 @@ func (f *fakeChatModel) Generate(_ context.Context, in []*schema.Message, _ ...m
 			return nil, f.condenseErr
 		}
 		return schema.AssistantMessage(f.condenseReply, nil), nil
+	}
+
+	// Dicek sebelum cabang generate, supaya test saran tidak ikut dibalas
+	// generateReply.
+	if len(in) > 0 && strings.HasPrefix(in[0].Content, saranInstructionAwal) {
+		if f.saranErr != nil {
+			return nil, f.saranErr
+		}
+		return schema.AssistantMessage(f.saranReply, nil), nil
 	}
 
 	if f.generateErr != nil {
@@ -74,6 +87,17 @@ func (f *fakeChatModel) jumlahCondense() int {
 	n := 0
 	for _, in := range f.panggilan {
 		if len(in) > 0 && in[0].Content == condenseInstruction {
+			n++
+		}
+	}
+	return n
+}
+
+// jumlahSaran menghitung berapa kali model diminta menyusun saran lanjutan.
+func (f *fakeChatModel) jumlahSaran() int {
+	n := 0
+	for _, in := range f.panggilan {
+		if len(in) > 0 && strings.HasPrefix(in[0].Content, saranInstructionAwal) {
 			n++
 		}
 	}
@@ -414,6 +438,110 @@ func TestPangkasRiwayat(t *testing.T) {
 		if m.Content != want {
 			t.Errorf("pesan ke-%d = %q, mau %q (harus dipotong dari depan)", i, m.Content, want)
 		}
+	}
+}
+
+// TestPrepareMengirimKonteks memastikan OnKonteks menerima konteks penuh yang
+// sama dengan yang diisi ke placeholder {context}.
+//
+// Fitur saran bergantung pada ini: ia menyusun pertanyaan lanjutan dari
+// potongan yang benar-benar dipakai menjawab, bukan dari teks jawaban.
+func TestPrepareMengirimKonteks(t *testing.T) {
+	docs := []*schema.Document{
+		{ID: "d1", Content: "Pasal 7 mengatur jenis naskah dinas."},
+		{ID: "d2", Content: "Naskah dinas pengaturan bersifat mengikat."},
+	}
+	cm := &fakeChatModel{generateReply: "ok"}
+
+	var (
+		dapat  []string
+		jumlah int
+	)
+	chain := newTestChain(t, cm, &fakeRetriever{docs: docs})
+
+	if _, err := chain.Ask(context.Background(), Pertanyaan{
+		Teks: "apa saja jenis naskah dinas?",
+		OnKonteks: func(k string) {
+			jumlah++
+			dapat = append(dapat, k)
+		},
+	}); err != nil {
+		t.Fatalf("menjalankan Ask: %v", err)
+	}
+
+	if jumlah != 1 {
+		t.Fatalf("OnKonteks dipanggil %d kali, mau 1", jumlah)
+	}
+	if mau := formatDocs(docs); dapat[0] != mau {
+		t.Errorf("konteks = %q, mau %q", dapat[0], mau)
+	}
+
+	// Konteks yang sama juga harus sampai ke prompt.
+	if !pesanMemuat(cm.pesanTerakhir(t), "Naskah dinas pengaturan bersifat mengikat.") {
+		t.Errorf("prompt tidak memuat konteks:\n%v", isiPesan(cm.pesanTerakhir(t)))
+	}
+}
+
+// TestOnKonteksDipanggilSebelumOnSumber memaku urutan dua callback itu.
+//
+// OnKonteks memulai penyusunan saran di latar belakang, sedangkan OnSumber
+// menulis ke respons HTTP yang bisa memblokir pada klien lambat. Kalau
+// urutannya terbalik, saran baru mulai setelah klien selesai menerima — persis
+// penundaan yang mau dihindari.
+func TestOnKonteksDipanggilSebelumOnSumber(t *testing.T) {
+	var urutan []string
+	chain := newTestChain(t,
+		&fakeChatModel{generateReply: "ok"},
+		&fakeRetriever{docs: docsUji()})
+
+	if _, err := chain.Ask(context.Background(), Pertanyaan{
+		Teks:      "kapan MPASI mulai?",
+		OnKonteks: func(string) { urutan = append(urutan, "konteks") },
+		OnSumber:  func([]string) { urutan = append(urutan, "sumber") },
+	}); err != nil {
+		t.Fatalf("menjalankan Ask: %v", err)
+	}
+
+	if len(urutan) != 2 || urutan[0] != "konteks" || urutan[1] != "sumber" {
+		t.Errorf("urutan callback = %v, mau [konteks sumber]", urutan)
+	}
+}
+
+// TestTanpaOnKonteksTidakPanik menjaga agar kedua callback tetap opsional.
+func TestTanpaOnKonteksTidakPanik(t *testing.T) {
+	chain := newTestChain(t,
+		&fakeChatModel{generateReply: "ok"},
+		&fakeRetriever{docs: docsUji()})
+
+	if _, err := chain.Ask(context.Background(), Pertanyaan{Teks: "kapan MPASI?"}); err != nil {
+		t.Fatalf("Ask tanpa callback gagal: %v", err)
+	}
+}
+
+// TestOnKonteksIkutSaatCondenseMenulisUlang memastikan callback tidak hilang
+// saat riwayat ada.
+//
+// condenseQuestion membangun struct langkah baru di dua jalur (langsung dan
+// hasil penulisan ulang). Kalau salah satu lupa menyalin OnKonteks, fitur saran
+// mati diam-diam hanya pada percakapan lanjutan — persis kasus yang paling
+// butuh saran.
+func TestOnKonteksIkutSaatCondenseMenulisUlang(t *testing.T) {
+	cm := &fakeChatModel{condenseReply: "Apa saja jenis naskah dinas?", generateReply: "ok"}
+	chain := newTestChain(t, cm, &fakeRetriever{docs: docsUji()})
+
+	dipanggil := 0
+	riwayat := []*schema.Message{schema.UserMessage("sebelumnya")}
+
+	if _, err := chain.Ask(context.Background(), Pertanyaan{
+		Teks:      "poin a di atas apa?",
+		Riwayat:   riwayat,
+		OnKonteks: func(string) { dipanggil++ },
+	}); err != nil {
+		t.Fatalf("menjalankan Ask: %v", err)
+	}
+
+	if dipanggil != 1 {
+		t.Errorf("OnKonteks dipanggil %d kali setelah condense, mau 1", dipanggil)
 	}
 }
 

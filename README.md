@@ -49,12 +49,15 @@ Dokumen sumber (PDF atau Markdown)
   Retriever                cari 10 chunk paling mirip
         │                  + kalau pertanyaan menyebut "pasal N", ambil
         │                    seluruh potongan pasal itu dan taruh di depan
-        ▼
+        │
+        ├─────────────────► Gemini (kedua)   susun saran pertanyaan lanjutan
+        │                                    ← hanya web, berjalan bersamaan
+        ▼                                      dengan jawaban
   Prompt Template          gabungkan konteks + riwayat + pertanyaan
         ▼
   Gemini                   susun jawaban
         ▼
-  Jawaban
+  Jawaban (+ tombol saran di web)
 ```
 
 Jalur tulis (embedding) dan jalur baca (pencarian) dipisah, sama seperti
@@ -301,12 +304,15 @@ Bagaimana streaming-nya bekerja:
 | Tailwind sumber / hasil | `internal/web/static/input.css` → `app.css` |
 | htmx + ekstensi SSE | `internal/web/static/*.js` (di-vendor lokal, bukan CDN) |
 
-Server mengirim empat jenis event: `delta` (potongan teks mentah, ditambahkan ke
+Server mengirim lima jenis event: `delta` (potongan teks mentah, ditambahkan ke
 layar), `sumber` (daftar rujukan potongan, lihat di bawah), `selesai` (HTML
-final hasil render Markdown yang menukar seluruh wadah jawaban), dan `tutup`
-(menutup koneksi). Event `tutup` sengaja dipisah: ekstensi SSE htmx punya
-penyambungan ulang otomatis, jadi tanpa penutup eksplisit pertanyaan akan
-dijalankan ulang setelah stream selesai.
+final hasil render Markdown yang menukar seluruh wadah jawaban), `saran`
+(tombol pertanyaan lanjutan, lihat di bawah), dan `tutup` (menutup koneksi).
+Event `tutup` sengaja dipisah: ekstensi SSE htmx punya penyambungan ulang
+otomatis, jadi tanpa penutup eksplisit pertanyaan akan dijalankan ulang setelah
+stream selesai. Urutannya `sumber → delta* → selesai → saran → tutup`; `saran`
+baru siap setelah jawaban habis, jadi ia menyusul di antara `selesai` dan
+`tutup`.
 
 Kotak pertanyaan menempel di dasar layar: tinggi halaman dikunci ke tinggi layar
 (`h-dvh`) dan hanya daftar jawaban yang menggulir. Jawaban yang sedang mengalir
@@ -400,6 +406,69 @@ Batasan yang perlu diketahui:
   autentikasi**, jadi siapa pun yang bisa menjangkau server ini bisa memulai
   percakapan baru.
 
+#### Saran pertanyaan lanjutan
+
+Di bawah blok rujukan, tiap jawaban di client web disertai beberapa tombol
+pertanyaan lanjutan. Sama seperti pertanyaan contoh di halaman utama, banyak
+pengunjung berhenti setelah satu jawaban karena tidak tahu apa lagi yang bisa
+ditanyakan.
+
+Tombolnya disusun model dari **pertanyaan pengguna dan konteks pasal yang
+terambil** — bukan dari teks jawaban. Dua alasan:
+
+- Konteks sudah ada di tangan saat retrieval selesai, jadi saran bisa mulai
+  disusun **bersamaan dengan jawaban**, bukan setelahnya. Saat jawaban selesai
+  dikirim, saran biasanya sudah siap.
+- Membaca teks jawaban berarti menunggu jawaban selesai lebih dulu, dan
+  pertanyaan lanjutan yang diturunkan dari jawaban cenderung mengulang jawaban
+  itu alih-alih membuka arah baru.
+
+Aliran datanya:
+
+```
+retriever → rag.LabelSumber(docs) → OnSumber  → event SSE "sumber"
+          → rag.formatDocs(docs)  → OnKonteks → goroutine cmd/rag → rag.Saran
+                                                   │ (bersamaan jawaban)
+jawaban   → delta* → selesai ──────────────────────┤
+                                                   ▼
+                       handleAlir tunggu saluran → event SSE "saran" → "tutup"
+```
+
+`rag.Alirkan` mengembalikan **saluran** saran, bukan menerima callback. Callback
+apa pun yang dipanggil di dalamnya pasti tiba sebelum event `selesai` — urutan
+terbalik, karena `handleAlir` baru mengirim `selesai` setelah `alirkan` kembali.
+Saluran juga memisahkan "jawaban selesai" dari "saran siap", sehingga jawaban
+tidak ikut tertunda menunggu model saran.
+
+Saran adalah **tambahan, bukan syarat**. Kegagalan apa pun di jalur ini — kuota
+habis, model error, hasil kosong, atau terlalu lambat — tidak memengaruhi
+jawaban, tidak menahan `tutup`, dan tidak menggagalkan handler:
+
+| Keadaan | Yang terjadi |
+|---|---|
+| `SARAN_COUNT=0` | fitur mati; model kedua tidak pernah dipanggil, tidak ada event `saran` |
+| Konteks kosong | model tidak dipanggil, saluran langsung ditutup |
+| Model saran error | dicatat di log, jawaban tetap utuh dan koneksi tetap ditutup |
+| Saran belum siap dalam 3 detik | penantian dilewati, `tutup` tetap dikirim, tombol tidak muncul |
+| Jawaban gagal di tengah jalan | saran tidak ditunggu sama sekali — percakapan yang terhenti tidak pantas ditawari lanjutan |
+
+Keluarannya satu pertanyaan per baris, bukan JSON: JSON yang rusak sedikit saja
+akan mematikan seluruh daftar, sedangkan baris demi baris tetap bisa
+diselamatkan. Penomoran, bullet, tanda kutip di ujung, baris kosong, baris
+pembuka berakhiran titik dua, duplikat, dan pertanyaan pengguna sendiri dibuang
+sebelum ditampilkan.
+
+Tombolnya mengirim pertanyaannya lewat **query string** (`hx-get="/tanya?q=…"`),
+bukan `hx-vals` berisi JSON seperti tombol di halaman utama. Saran berasal dari
+model dan bisa memuat tanda kutip: `hx-vals='{"q":"…"}'` akan rusak karena
+html/template meng-escape kutip jadi `&#34;`, browser meng-decode-nya kembali
+jadi kutip, dan JSON-nya jadi tidak sah — tombolnya tidak bereaksi. Pola query
+string sudah dipakai koneksi SSE dan `handleTanya`.
+
+Beban modelnya perlu diperhitungkan: tiap giliran di client web kini memakai
+dua panggilan chat yang mulai hampir bersamaan. `SARAN_COUNT=0` mematikannya
+tanpa mengubah apa pun yang lain.
+
 ### Menjalankan test
 
 ```bash
@@ -447,6 +516,20 @@ pertanyaan asli, bahwa giliran pertama tidak memanggil model ekstra, bahwa
 riwayat menumpuk per sesi dan tidak bocor antar sesi, serta bahwa "Percakapan
 baru" benar-benar mengosongkan riwayat — termasuk ketika ditekan selagi jawaban
 masih mengalir.
+
+Jalur saran juga diuji tanpa API, di tiga lapis. Di `internal/rag`: bahwa
+keluaran model yang kotor (penomoran, bullet, tanda kutip, baris pembuka,
+duplikat) dibersihkan, bahwa jumlahnya dibatasi, bahwa pertanyaan pengguna
+sendiri tidak ditawarkan ulang, dan bahwa `SARAN_COUNT=0` serta konteks kosong
+tidak memanggil model sama sekali. Di `cmd/rag`: bahwa saluran saran selalu
+tertutup — termasuk saat konteks kosong, fitur mati, model gagal, dan context
+dibatalkan — dan bahwa callback konteks yang terpanggil dua kali tetap hanya
+memanggil model sekali. Di `internal/web`: bahwa urutan event
+`selesai < saran < tutup` dijaga, bahwa tidak ada event `saran` kalau tidak ada
+saran atau jawabannya gagal, bahwa koneksi tetap ditutup saat model saran
+lambat (batas waktunya dipercepat di test), bahwa teks saran di-escape, dan
+bahwa pertanyaan yang memuat tanda kutip bolak-balik utuh lewat query string
+sampai ke `handleTanya`.
 
 Satu test — `TestIDHasilGenerateCocokDenganYangTersimpan` — memang membaca
 Qdrant, karena yang dibuktikan adalah ingest bersifat idempotent: ID yang
@@ -1128,6 +1211,7 @@ rag-eino/
 │   │   ├── retriever.go         tambahan: ambil langsung pasal yang disebut,
 │   │   │                        lalu ikuti rujukan silangnya satu lompatan
 │   │   ├── cari.go              retrieval saja, untuk memeriksa hasil pencarian
+│   │   ├── saran.go             saran pertanyaan lanjutan (web saja)
 │   │   ├── sumber.go            label rujukan potongan ("Pasal 7", "Lampiran")
 │   │   └── chain_test.go        verifikasi wiring, streaming, dan memori
 │   └── web/
@@ -1159,6 +1243,7 @@ Semua pengaturan dibaca dari `.env`. Daftar lengkapnya ada di `.env.example`.
 | `CHUNK_OVERLAP` | `100` | hanya dipakai `CHUNK_STRATEGY=recursive` |
 | `TOP_K` | `10` | jumlah chunk yang diambil |
 | `HISTORY_MESSAGES` | `6` | jumlah pesan riwayat percakapan yang disertakan; `0` mematikan memori |
+| `SARAN_COUNT` | `3` | jumlah tombol saran pertanyaan lanjutan di client web; `0` mematikan fitur. Tidak dipakai `rag ask` |
 
 ### Mengganti dokumen
 

@@ -94,13 +94,28 @@ func cookieSesiMuat(t *testing.T, srv *Server) *http.Cookie {
 
 // alirkanTetap adalah penjawab palsu yang mengirim potongan lalu berhasil.
 func alirkanTetap(potongan ...string) Alirkan {
-	return func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) error {
+	return func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		for _, p := range potongan {
 			if err := delta(p); err != nil {
-				return err
+				return nil, err
 			}
 		}
-		return nil
+		return nil, nil
+	}
+}
+
+// alirkanSaran adalah penjawab palsu yang mengirim jawaban lalu menyerahkan
+// saran lewat saluran, meniru saran yang sudah siap saat jawaban habis.
+func alirkanSaran(potongan string, saran ...string) Alirkan {
+	return func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
+		if err := delta(potongan); err != nil {
+			return nil, err
+		}
+
+		ch := make(chan []string, 1)
+		ch <- saran
+		close(ch)
+		return ch, nil
 	}
 }
 
@@ -455,11 +470,11 @@ func TestAlirMengirimEventBertahap(t *testing.T) {
 // tahu dasar jawabannya sementara teksnya masih mengalir.
 func TestAlirMengirimRujukanSebelumJawaban(t *testing.T) {
 	alirkan := func(_ context.Context, _ string, _ []Pesan,
-		delta func(string) error, sumber func([]string) error) error {
+		delta func(string) error, sumber func([]string) error) (SaluranSaran, error) {
 		if err := sumber([]string{"Pasal 7", "Lampiran"}); err != nil {
-			return err
+			return nil, err
 		}
-		return delta("Jenis naskah dinas ada tiga.")
+		return nil, delta("Jenis naskah dinas ada tiga.")
 	}
 
 	rec := panggil(t, newTestServer(t, alirkan), "/tanya/alir?q=x")
@@ -503,6 +518,161 @@ func TestAlirTanpaRujukanTidakMengirimEvent(t *testing.T) {
 	}
 }
 
+// TestAlirMengirimSaranSetelahJawaban mengunci urutan event saran.
+//
+// Saran baru siap setelah jawaban selesai dikirim, tapi tetap harus terkirim
+// sebelum koneksi ditutup — kalau "saran" datang setelah "tutup", htmx sudah
+// memutus koneksi dan tombolnya tidak akan pernah muncul.
+func TestAlirMengirimSaranSetelahJawaban(t *testing.T) {
+	rec := panggil(t,
+		newTestServer(t, alirkanSaran("jawaban", "Apa syaratnya?", "Berapa lama prosesnya?")),
+		"/tanya/alir?q=x")
+
+	isi := rec.Body.String()
+
+	iSelesai := strings.Index(isi, "event: selesai")
+	iSaran := strings.Index(isi, "event: saran")
+	iTutup := strings.Index(isi, "event: tutup")
+
+	if iSelesai < 0 || iSaran < 0 || iTutup < 0 {
+		t.Fatalf("event tidak lengkap (selesai=%d saran=%d tutup=%d):\n%s", iSelesai, iSaran, iTutup, isi)
+	}
+	if !(iSelesai < iSaran && iSaran < iTutup) {
+		t.Errorf("urutan event salah (selesai=%d saran=%d tutup=%d):\n%s", iSelesai, iSaran, iTutup, isi)
+	}
+
+	for _, saran := range []string{"Apa syaratnya?", "Berapa lama prosesnya?"} {
+		if !strings.Contains(isi, saran) {
+			t.Errorf("respons tidak memuat saran %q:\n%s", saran, isi)
+		}
+	}
+
+	// Saran tidak boleh bocor ke HTML jawaban: ia tombol, bukan bagian jawaban.
+	if strings.Contains(isi, "<p>Apa syaratnya?") {
+		t.Errorf("saran bocor ke dalam teks jawaban:\n%s", isi)
+	}
+}
+
+// TestAlirTanpaSaranTidakMengirimEvent menjaga wadah saran dari blok kosong.
+//
+// Kalau tidak ada saran — fitur dimatikan, konteks kosong, atau model gagal —
+// event "saran" tidak dikirim sama sekali. Kalau dikirim, wadahnya terisi
+// pembungkus berisi tulisan "Lanjutkan:" tanpa satu pun tombol.
+func TestAlirTanpaSaranTidakMengirimEvent(t *testing.T) {
+	rec := panggil(t, newTestServer(t, alirkanTetap("jawaban")), "/tanya/alir?q=x")
+
+	if isi := rec.Body.String(); strings.Contains(isi, "event: saran") {
+		t.Errorf("event saran terkirim padahal tidak ada saran:\n%s", isi)
+	}
+}
+
+// TestAlirTetapMenutupSaatSaranLambat menjaga koneksi tidak menggantung.
+//
+// Saran adalah tambahan: model yang lambat tidak boleh menahan penutup sampai
+// browser menyerah. Batas waktunya dipercepat di sini supaya test tidak ikut
+// menunggu tiga detik.
+func TestAlirTetapMenutupSaatSaranLambat(t *testing.T) {
+	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
+		if err := delta("jawaban"); err != nil {
+			return nil, err
+		}
+		// Saluran yang tidak pernah diisi dan tidak pernah ditutup: meniru
+		// model saran yang belum selesai.
+		return make(chan []string), nil
+	}
+
+	srv := newTestServer(t, alirkan)
+	srv.waktuTungguSaran = 50 * time.Millisecond
+
+	isi := panggil(t, srv, "/tanya/alir?q=x").Body.String()
+
+	if !strings.Contains(isi, "event: tutup") {
+		t.Errorf("koneksi tidak ditutup saat saran lambat:\n%s", isi)
+	}
+	if strings.Contains(isi, "event: saran") {
+		t.Errorf("event saran terkirim padahal belum siap:\n%s", isi)
+	}
+}
+
+// TestAlirTidakMengirimSaranSaatJawabanGagal memastikan percakapan yang
+// terhenti tidak ditawari lanjutan.
+//
+// Pengguna belum sempat membaca jawabannya, jadi menawarkan pertanyaan
+// berikutnya hanya membingungkan.
+func TestAlirTidakMengirimSaranSaatJawabanGagal(t *testing.T) {
+	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
+		if err := delta("awal "); err != nil {
+			return nil, err
+		}
+
+		ch := make(chan []string, 1)
+		ch <- []string{"Apa syaratnya?"}
+		close(ch)
+		return ch, errors.New("kuota habis")
+	}
+
+	isi := panggil(t, newTestServer(t, alirkan), "/tanya/alir?q=x").Body.String()
+
+	if strings.Contains(isi, "event: saran") {
+		t.Errorf("saran terkirim padahal jawaban gagal:\n%s", isi)
+	}
+	if !strings.Contains(isi, "event: tutup") {
+		t.Errorf("koneksi tidak ditutup saat gagal:\n%s", isi)
+	}
+}
+
+// TestSaranMengescapeTeks menutup celah penyuntikan lewat keluaran model.
+//
+// Saran berasal dari model dan htmx menukar isi event sebagai HTML, jadi
+// teksnya harus di-escape sebelum dirender jadi tombol.
+func TestSaranMengescapeTeks(t *testing.T) {
+	srv := newTestServer(t, alirkanTetap("x"))
+
+	htmlSaran := srv.renderSaran([]string{`<script>alert(1)</script>`})
+
+	if strings.Contains(htmlSaran, "<script>alert(1)</script>") {
+		t.Errorf("teks saran tidak di-escape:\n%s", htmlSaran)
+	}
+	if !strings.Contains(htmlSaran, "&lt;script&gt;") {
+		t.Errorf("teks saran tidak tampil ter-escape:\n%s", htmlSaran)
+	}
+}
+
+// TestSaranMengirimLewatQueryStringTanya adalah uji regresi untuk pilihan
+// query string alih-alih hx-vals.
+//
+// Saran bisa memuat tanda kutip. Kalau pertanyaannya ditulis di hx-vals berisi
+// JSON, html/template meng-escape kutip jadi &#34;, browser meng-decode-nya
+// kembali jadi kutip, dan JSON-nya jadi tidak sah — tombolnya tidak bereaksi.
+// Query string tidak punya masalah itu, dan test ini membuktikan pertanyaannya
+// bolak-balik utuh sampai ke handleTanya.
+func TestSaranMengirimLewatQueryStringTanya(t *testing.T) {
+	const pertanyaan = `Apa itu "lembar disposisi"?`
+
+	srv := newTestServer(t, alirkanTetap("x"))
+
+	target := ambilAtribut(t, srv.renderSaran([]string{pertanyaan}), "hx-get")
+
+	u, err := url.Parse(target)
+	if err != nil {
+		t.Fatalf("hx-get %q tidak bisa dibaca: %v", target, err)
+	}
+	if got := u.Query().Get("q"); got != pertanyaan {
+		t.Errorf("q pada hx-get = %q, mau %q", got, pertanyaan)
+	}
+
+	// Dan handleTanya harus menerimanya bulat sebagai fragmen pertanyaan.
+	// Dibandingkan setelah unescape, supaya bentuk escape-nya (&#34; atau
+	// &quot;) tidak jadi bagian yang diuji.
+	rec := panggil(t, srv, target)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET %s status = %d, mau %d", target, rec.Code, http.StatusOK)
+	}
+	if teks := html.UnescapeString(rec.Body.String()); !strings.Contains(teks, pertanyaan) {
+		t.Errorf("fragmen tidak memuat pertanyaan asli %q:\n%s", pertanyaan, rec.Body.String())
+	}
+}
+
 // TestRujukanMengescapeLabel menutup celah penyuntikan lewat metadata dokumen.
 //
 // Label diambil dari metadata potongan, dan htmx menukar isi event sebagai
@@ -510,11 +680,11 @@ func TestAlirTanpaRujukanTidakMengirimEvent(t *testing.T) {
 // harus tetap berlaku supaya dokumen lain tidak bisa menyuntikkan markup.
 func TestRujukanMengescapeLabel(t *testing.T) {
 	alirkan := func(_ context.Context, _ string, _ []Pesan,
-		delta func(string) error, sumber func([]string) error) error {
+		delta func(string) error, sumber func([]string) error) (SaluranSaran, error) {
 		if err := sumber([]string{"<script>alert(1)</script>"}); err != nil {
-			return err
+			return nil, err
 		}
-		return delta("jawaban")
+		return nil, delta("jawaban")
 	}
 
 	rec := panggil(t, newTestServer(t, alirkan), "/tanya/alir?q=x")
@@ -564,11 +734,11 @@ func TestAlirMengescapePotongan(t *testing.T) {
 // TestAlirTetapMenutupSaatGagal memastikan halaman tidak menggantung ketika
 // penjawab berhenti di tengah jalan: penutup harus tetap dikirim.
 func TestAlirTetapMenutupSaatGagal(t *testing.T) {
-	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		if err := delta("awal "); err != nil {
-			return err
+			return nil, err
 		}
-		return errors.New("kuota habis")
+		return nil, errors.New("kuota habis")
 	}
 
 	rec := panggil(t, newTestServer(t, alirkan), "/tanya/alir?q=x")
@@ -606,15 +776,15 @@ func TestSajikanMenungguAliranSelesaiSaatDibatalkan(t *testing.T) {
 	mulai := make(chan struct{})
 	lepas := make(chan struct{})
 
-	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		if err := delta("pertama "); err != nil {
-			return err
+			return nil, err
 		}
 
 		close(mulai)
 		<-lepas
 
-		return delta("terakhir")
+		return nil, delta("terakhir")
 	}
 
 	srv := newTestServer(t, alirkan)
@@ -702,6 +872,7 @@ func TestKelasAdaDiCSS(t *testing.T) {
 	markup := map[string]string{
 		"halaman utama": panggil(t, srv, "/").Body.String(),
 		"blok rujukan":  srv.renderSumber([]string{"Pasal 7", "Lampiran"}),
+		"blok saran":    srv.renderSaran([]string{"Apa syaratnya?", "Berapa lama prosesnya?"}),
 	}
 	for _, nama := range []string{"pesan-netral", "pesan-galat", "pesan-sibuk"} {
 		markup[nama] = srv.renderPesan(nama, "teks uji")
@@ -789,9 +960,9 @@ func TestIndexMenyetelCookieSesi(t *testing.T) {
 func TestRiwayatMenumpukDalamSatuSesi(t *testing.T) {
 	var tercatat [][]Pesan
 
-	alirkan := func(_ context.Context, pertanyaan string, riwayat []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, pertanyaan string, riwayat []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		tercatat = append(tercatat, riwayat)
-		return delta("jawaban untuk " + pertanyaan)
+		return nil, delta("jawaban untuk " + pertanyaan)
 	}
 
 	srv := newTestServer(t, alirkan)
@@ -823,9 +994,9 @@ func TestRiwayatMenumpukDalamSatuSesi(t *testing.T) {
 func TestSesiBerbedaTidakBerbagiRiwayat(t *testing.T) {
 	var tercatat [][]Pesan
 
-	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		tercatat = append(tercatat, riwayat)
-		return delta("ok")
+		return nil, delta("ok")
 	}
 
 	srv := newTestServer(t, alirkan)
@@ -863,9 +1034,9 @@ func TestSesiBerbedaTidakBerbagiRiwayat(t *testing.T) {
 func TestPercakapanBaruMengosongkanRiwayat(t *testing.T) {
 	var tercatat [][]Pesan
 
-	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		tercatat = append(tercatat, riwayat)
-		return delta("ok")
+		return nil, delta("ok")
 	}
 
 	srv := newTestServer(t, alirkan)
@@ -903,13 +1074,13 @@ func TestPercakapanBaruMengosongkanRiwayat(t *testing.T) {
 func TestGiliranGagalTidakDicatat(t *testing.T) {
 	var tercatat [][]Pesan
 
-	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		tercatat = append(tercatat, riwayat)
 
 		if len(tercatat) == 1 {
-			return errors.New("kuota habis")
+			return nil, errors.New("kuota habis")
 		}
-		return delta("ok")
+		return nil, delta("ok")
 	}
 
 	srv := newTestServer(t, alirkan)
@@ -942,9 +1113,9 @@ func TestSesiSibukDitolak(t *testing.T) {
 	// dengan pesan yang jelas.
 	var n int32
 
-	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		if err := delta("sedang menyusun"); err != nil {
-			return err
+			return nil, err
 		}
 
 		if atomic.AddInt32(&n, 1) == 1 {
@@ -952,7 +1123,7 @@ func TestSesiSibukDitolak(t *testing.T) {
 			<-lepas
 		}
 
-		return nil
+		return nil, nil
 	}
 
 	srv := newTestServer(t, alirkan)
@@ -994,18 +1165,18 @@ func TestResetSaatMengalirTidakMenghidupkanRiwayat(t *testing.T) {
 	mulai := make(chan struct{})
 	lepas := make(chan struct{})
 
-	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) error {
+	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
 		tercatat = append(tercatat, riwayat)
 
 		if err := delta("jawaban"); err != nil {
-			return err
+			return nil, err
 		}
 
 		if len(tercatat) == 1 {
 			close(mulai)
 			<-lepas
 		}
-		return nil
+		return nil, nil
 	}
 
 	srv := newTestServer(t, alirkan)

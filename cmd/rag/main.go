@@ -18,9 +18,11 @@ import (
 	"os/signal"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive"
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
 	qdrantclient "github.com/qdrant/go-client/qdrant"
 
@@ -397,7 +399,7 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 		return err
 	}
 
-	srv, err := web.New(alirkanDariChain(chain, cfg.HistoryMessages), web.Tampilan{
+	srv, err := web.New(alirkanDariChain(chain, ai.ChatModel, cfg.HistoryMessages, cfg.SaranCount), web.Tampilan{
 		Title:      cfg.AppTitle,
 		Subtitle:   cfg.AppSubtitle,
 		Model:      cfg.ChatModel,
@@ -421,11 +423,19 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 // potongan mana yang terpakai setelah node retrieval berjalan — dan itu terjadi
 // di tengah aliran, sebelum potongan jawaban pertama tiba.
 //
+// Saran pertanyaan lanjutan disusun model kedua yang mulai bekerja begitu
+// retrieval selesai, bersamaan dengan jawaban. Hasilnya dikembalikan sebagai
+// saluran, bukan dikirim lewat callback, karena saran baru siap setelah jawaban
+// habis — lihat web.SaluranSaran.
+//
 // Fungsi ini sekaligus satu-satunya tempat paket web bertemu tipe Eino:
 // riwayat diterjemahkan dari web.Pesan ke schema.Message sebelum masuk chain.
-func alirkanDariChain(chain *rag.Chain, historyMaks int) web.Alirkan {
+func alirkanDariChain(chain *rag.Chain, cm model.BaseChatModel, historyMaks, jumlahSaran int) web.Alirkan {
 	return func(ctx context.Context, pertanyaan string, riwayat []web.Pesan,
-		delta func(string) error, sumber func([]string) error) error {
+		delta func(string) error, sumber func([]string) error) (web.SaluranSaran, error) {
+
+		mulai, saluran := saranBersamaan(ctx, cm, pertanyaan, jumlahSaran)
+
 		sr, err := chain.Stream(ctx, rag.Pertanyaan{
 			Teks:    pertanyaan,
 			Riwayat: rag.PangkasRiwayat(keSchemaMessages(riwayat), historyMaks),
@@ -438,25 +448,81 @@ func alirkanDariChain(chain *rag.Chain, historyMaks int) web.Alirkan {
 					log.Printf("rag: mengirim rujukan gagal: %v", err)
 				}
 			},
+			// Konteks potongan tidak dikembalikan ke pemanggil — isinya bisa
+			// panjang dan tidak untuk ditampilkan. Ia hanya memicu penyusunan
+			// saran, sekali, di latar belakang.
+			OnKonteks: mulai,
 		})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		defer sr.Close()
 
 		for {
 			potongan, err := sr.Recv()
 			if errors.Is(err, io.EOF) {
-				return nil
+				return saluran, nil
 			}
 			if err != nil {
-				return err
+				return nil, err
 			}
 			if err := delta(potongan); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	}
+}
+
+// saranBersamaan menyiapkan penyusunan saran pertanyaan lanjutan yang berjalan
+// bersamaan dengan penyusunan jawaban.
+//
+// Mengembalikan dua hal: mulai, yang dipanggil sekali dengan konteks potongan
+// begitu retrieval selesai, dan saluran hasil saran. Keduanya netral terhadap
+// paket web; pemanggil yang memutuskan apa yang dilakukan dengan hasilnya.
+//
+// Saluran selalu ditutup — baik fitur dimatikan, konteks kosong, maupun model
+// gagal — sehingga pembaca tidak pernah menggantung menunggu isi yang tidak
+// akan datang.
+func saranBersamaan(ctx context.Context, cm model.BaseChatModel, pertanyaan string, jumlah int) (mulai func(string), saluran <-chan []string) {
+	// Berbuffer 1 supaya goroutine pengirim tidak pernah memblokir kalau
+	// pemanggil sudah lebih dulu berhenti membaca — misalnya karena jawaban
+	// gagal dan handleAlir langsung menutup koneksi.
+	ch := make(chan []string, 1)
+
+	if jumlah <= 0 {
+		close(ch)
+		return func(string) {}, ch
+	}
+
+	// sekali menjaga penyusunan saran hanya berjalan sekali, walau callback
+	// konteks terpanggil lebih dari sekali.
+	var sekali sync.Once
+
+	mulai = func(konteks string) {
+		sekali.Do(func() {
+			if strings.TrimSpace(konteks) == "" {
+				close(ch)
+				return
+			}
+
+			go func() {
+				defer close(ch)
+
+				hasil, err := rag.Saran(ctx, cm, pertanyaan, konteks, jumlah)
+				if err != nil {
+					// Saran hanya tambahan: kegagalannya dicatat, tidak
+					// dilaporkan sebagai kegagalan jawaban.
+					log.Printf("rag: menyusun saran gagal: %v", err)
+					return
+				}
+				if len(hasil) > 0 {
+					ch <- hasil
+				}
+			}()
+		})
+	}
+
+	return mulai, ch
 }
 
 // keSchemaMessages menerjemahkan riwayat percakapan dari tipe netral paket web

@@ -76,6 +76,14 @@ type Pertanyaan struct {
 	// menjalankannya. Callback yang dipegang pemanggil adalah satu-satunya cara
 	// mengabarkan hasil itu tanpa menahan aliran jawaban sampai graph selesai.
 	OnSumber func([]string)
+	// OnKonteks dipanggil sekali setelah retrieval selesai, berisi seluruh
+	// konteks potongan yang dipakai menyusun jawaban. Boleh nil.
+	//
+	// Dipisah dari OnSumber karena keduanya punya pemakai berbeda: OnSumber
+	// membawa label singkat untuk ditampilkan, sedangkan OnKonteks membawa isi
+	// potongan penuh — dipakai fitur saran untuk menyusun pertanyaan lanjutan
+	// tanpa harus membaca ulang dokumen dari vector store.
+	OnKonteks func(string)
 }
 
 // langkah adalah nilai yang mengalir dari node condense ke node prepare.
@@ -84,10 +92,11 @@ type Pertanyaan struct {
 // sudah ditulis ulang supaya kata kuncinya cocok dengan isi dokumen,
 // sementara model tetap menerima pertanyaan asli pengguna apa adanya.
 type langkah struct {
-	Query    string
-	Asli     string
-	Riwayat  []*schema.Message
-	OnSumber func([]string)
+	Query     string
+	Asli      string
+	Riwayat   []*schema.Message
+	OnSumber  func([]string)
+	OnKonteks func(string)
 }
 
 // Chain adalah pipeline RAG yang sudah dirakit dan siap dipanggil.
@@ -228,7 +237,7 @@ func PangkasRiwayat(riwayat []*schema.Message, maks int) []*schema.Message {
 // sebelum fitur memori ada.
 func condenseQuestion(cm model.BaseChatModel) func(context.Context, Pertanyaan) (langkah, error) {
 	return func(ctx context.Context, in Pertanyaan) (langkah, error) {
-		langsung := langkah{Query: in.Teks, Asli: in.Teks, Riwayat: in.Riwayat, OnSumber: in.OnSumber}
+		langsung := langkah{Query: in.Teks, Asli: in.Teks, Riwayat: in.Riwayat, OnSumber: in.OnSumber, OnKonteks: in.OnKonteks}
 		if len(in.Riwayat) == 0 {
 			return langsung, nil
 		}
@@ -260,10 +269,11 @@ func condenseQuestion(cm model.BaseChatModel) func(context.Context, Pertanyaan) 
 		log.Printf("pertanyaan ditulis ulang: %q", query)
 
 		return langkah{
-			Query:    query,
-			Asli:     in.Teks,
-			Riwayat:  in.Riwayat,
-			OnSumber: in.OnSumber,
+			Query:     query,
+			Asli:      in.Teks,
+			Riwayat:   in.Riwayat,
+			OnSumber:  in.OnSumber,
+			OnKonteks: in.OnKonteks,
 		}, nil
 	}
 }
@@ -284,14 +294,24 @@ func prepareContext(ret retriever.Retriever) func(context.Context, langkah) (map
 
 		log.Printf("retriever mengembalikan %d chunk", len(docs))
 
+		konteks := formatDocs(docs)
+
 		// Dikabarkan sebelum model mulai menjawab, supaya antarmuka bisa
 		// menampilkan rujukannya lebih dulu alih-alih menunggu jawaban utuh.
+		//
+		// OnKonteks didahulukan atas OnSumber: ia yang memulai penyusunan saran
+		// di latar belakang, jadi makin cepat dipanggil makin besar peluang
+		// saran siap saat jawaban selesai. OnSumber menulis ke respons HTTP,
+		// yang bisa memblokir pada klien lambat.
+		if in.OnKonteks != nil {
+			in.OnKonteks(konteks)
+		}
 		if in.OnSumber != nil {
 			in.OnSumber(LabelSumber(docs))
 		}
 
 		out := map[string]any{
-			"context": formatDocs(docs),
+			"context": konteks,
 			// Pertanyaan asli, bukan hasil condense: pengguna harus melihat
 			// jawaban atas apa yang benar-benar ia tanyakan.
 			"question": in.Asli,

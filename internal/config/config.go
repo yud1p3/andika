@@ -108,6 +108,13 @@ type Config struct {
 	// penulisan ulang pertanyaan; makin panjang riwayat, makin besar prompt
 	// yang dikirim ke Gemini.
 	HistoryMessages int
+
+	// SaranCount adalah jumlah tombol pertanyaan lanjutan yang disusun setelah
+	// sebuah jawaban di client web. 0 mematikan fitur: model tidak dipanggil
+	// kedua kali, dan tidak ada tombol yang ditampilkan.
+	//
+	// Dipakai hanya oleh "rag serve"; "rag ask" tidak menyentuhnya.
+	SaranCount int
 }
 
 // Load membaca file .env (kalau ada) lalu environment variable, dan mengisi
@@ -142,12 +149,20 @@ func Load() (*Config, error) {
 		// 6 pesan = 3 giliran tanya-jawab terakhir. Cukup untuk merujuk
 		// "poin a di atas" tanpa membengkakkan prompt.
 		HistoryMessages: envInt("HISTORY_MESSAGES", 6, &errs),
+		// 3 tombol cukup untuk membuka arah lanjutan tanpa memenuhi layar,
+		// dan tiap saran berarti satu panggilan model tambahan per jawaban.
+		SaranCount: envInt("SARAN_COUNT", 3, &errs),
 	}
 
 	// Jumlah pesan negatif tidak punya arti. Diperlakukan sebagai 0 (memori
 	// mati) alih-alih menggagalkan seluruh konfigurasi karena salah ketik.
 	if cfg.HistoryMessages < 0 {
 		cfg.HistoryMessages = 0
+	}
+
+	// Sama untuk jumlah saran: negatif diperlakukan sebagai 0 (fitur mati).
+	if cfg.SaranCount < 0 {
+		cfg.SaranCount = 0
 	}
 
 	// Strategi pemotongan yang tidak dikenal dilaporkan sebagai error, bukan

@@ -51,6 +51,16 @@ const (
 	// ini dibuang saat halaman utama dibuka, supaya riwayat pengunjung yang
 	// sudah pergi tidak menumpuk di memori selamanya.
 	sesiTTL = 30 * time.Minute
+
+	// tungguSaranDefault adalah batas waktu menunggu saran setelah jawaban
+	// selesai dikirim.
+	//
+	// Saran mulai disusun bersamaan dengan jawaban, jadi biasanya sudah siap
+	// atau hampir siap saat jawaban habis. Batas ini hanya jaring pengaman
+	// untuk model yang lambat: lebih baik tombolnya tidak muncul daripada
+	// koneksi SSE menggantung. Disimpan sebagai field Server supaya test bisa
+	// mempercepatnya tanpa variabel paket yang dibagi antar-test.
+	tungguSaranDefault = 3 * time.Second
 )
 
 // Peran pengirim pesan di riwayat percakapan. Diekspor karena pemanggil di
@@ -69,6 +79,20 @@ type Pesan struct {
 	Peran string // PeranUser atau PeranAssistant
 	Isi   string
 }
+
+// SaluranSaran mengalirkan saran pertanyaan lanjutan yang disusun bersamaan
+// dengan jawaban.
+//
+// Ditutup tanpa isi kalau tidak ada saran yang bisa dipakai — fitur dimatikan,
+// konteks kosong, atau model gagal. Nil berarti fitur mati sejak awal, dan
+// pemanggil tidak perlu menunggu apa pun.
+//
+// Berupa saluran, bukan callback, karena saran baru siap SETELAH jawaban
+// selesai dikirim: callback apa pun yang dipanggil di dalam Alirkan pasti tiba
+// sebelum event "selesai", yaitu urutan terbalik. Saluran juga memisahkan
+// "jawaban selesai" dari "saran siap", sehingga jawaban tidak ikut tertunda
+// menunggu model saran.
+type SaluranSaran <-chan []string
 
 // Alirkan menjalankan satu pertanyaan dan menulis potongan jawaban lewat delta.
 //
@@ -90,6 +114,9 @@ type Pesan struct {
 // potongan yang benar-benar dikirim ke layar. Dengan begitu HTML final dijamin
 // cocok dengan teks yang tadi terlihat mengalir.
 //
+// Saran pertanyaan lanjutan dikembalikan sebagai saluran, bukan dikirim lewat
+// callback, karena saran baru siap setelah jawaban selesai. Lihat SaluranSaran.
+//
 // Tipe ini sengaja dipakai sebagai seam: paket web tidak perlu tahu apa-apa
 // tentang Eino, Qdrant, atau Gemini, sehingga handler-nya bisa diuji tanpa
 // jaringan maupun API key.
@@ -99,7 +126,7 @@ type Alirkan func(
 	riwayat []Pesan,
 	delta func(string) error,
 	sumber func([]string) error,
-) error
+) (SaluranSaran, error)
 
 // Tampilan adalah keterangan yang dipajang di kepala halaman.
 type Tampilan struct {
@@ -208,6 +235,10 @@ type Server struct {
 	md       goldmark.Markdown
 	statik   http.Handler
 
+	// waktuTungguSaran membatasi berapa lama handleAlir menunggu saran
+	// setelah jawaban selesai. Lihat tungguSaranDefault.
+	waktuTungguSaran time.Duration
+
 	// mu melindungi map sesi; isi tiap sesi dilindungi mu milik sesi itu.
 	mu   sync.Mutex
 	sesi map[string]*sesi
@@ -231,9 +262,10 @@ func New(alirkan Alirkan, tampilan Tampilan) (*Server, error) {
 		tmpl:     tmpl,
 		// Tanpa opsi html.WithUnsafe, sehingga HTML mentah yang mungkin
 		// ditulis model tidak bisa menyisipkan tag ke halaman.
-		md:     goldmark.New(),
-		statik: http.FileServerFS(statik),
-		sesi:   make(map[string]*sesi),
+		md:               goldmark.New(),
+		statik:           http.FileServerFS(statik),
+		waktuTungguSaran: tungguSaranDefault,
+		sesi:             make(map[string]*sesi),
 	}, nil
 }
 
@@ -436,12 +468,16 @@ func (s *Server) handleTanya(w http.ResponseWriter, r *http.Request) {
 //
 // Urutan event yang dikirim:
 //
+//	sumber     label rujukan potongan, sebelum delta pertama
 //	delta  …   potongan teks mentah, ditambahkan ke layar
 //	selesai    HTML final hasil render Markdown, menukar seluruh wadah jawaban
+//	saran      tombol pertanyaan lanjutan, disusun bersamaan dengan jawaban
 //	tutup      memicu sse-close di klien
 //
 // "tutup" dipisah dari "selesai" supaya penutupan koneksi tidak berlomba
-// dengan penukaran HTML terakhir.
+// dengan penukaran HTML terakhir. "saran" disisipkan di antara keduanya karena
+// ia baru siap setelah jawaban habis, tapi tetap harus terkirim sebelum
+// koneksi ditutup.
 func (s *Server) handleAlir(w http.ResponseWriter, r *http.Request) {
 	pertanyaan := strings.TrimSpace(r.URL.Query().Get("q"))
 	if pertanyaan == "" {
@@ -508,7 +544,7 @@ func (s *Server) handleAlir(w http.ResponseWriter, r *http.Request) {
 		return kirim("sumber", s.renderSumber(sumber))
 	}
 
-	err := s.alirkan(r.Context(), pertanyaan, riwayat, func(potongan string) error {
+	saluran, err := s.alirkan(r.Context(), pertanyaan, riwayat, func(potongan string) error {
 		utuh.WriteString(potongan)
 		// Potongan di-escape karena htmx menukar isi event sebagai HTML.
 		// Tanpa ini, teks seperti "<b>" dari model akan disisipkan sebagai tag.
@@ -544,6 +580,32 @@ func (s *Server) handleAlir(w http.ResponseWriter, r *http.Request) {
 	if err := kirim("selesai", final); err != nil {
 		return
 	}
+
+	// Saran menyusul setelah jawaban selesai. Fitur ini tambahan: apa pun yang
+	// terjadi di sini tidak boleh menggagalkan handler, dan penantiannya
+	// dibatasi supaya koneksi tidak menggantung kalau model saran lambat.
+	//
+	// Hanya ditunggu kalau jawabannya berhasil. Percakapan yang terhenti tidak
+	// pantas ditawari lanjutan — pengguna belum sempat membaca jawabannya.
+	if err == nil && saluran != nil {
+		batas := time.NewTimer(s.waktuTungguSaran)
+		select {
+		case daftar := <-saluran:
+			batas.Stop()
+			if len(daftar) > 0 {
+				if e := kirim("saran", s.renderSaran(daftar)); e != nil {
+					return
+				}
+			}
+		case <-batas.C:
+			log.Printf("web: saran tidak siap dalam %s, dilewati", s.waktuTungguSaran)
+		case <-r.Context().Done():
+			// Klien memutus koneksi; tidak ada lagi yang bisa dikirimi.
+			batas.Stop()
+			return
+		}
+	}
+
 	_ = kirim("tutup", "")
 }
 
@@ -617,8 +679,41 @@ func (s *Server) renderSumber(sumber []string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// tulisEvent menulis satu pesan Server-Sent Events.
+// saranItem adalah satu tombol saran di template.
 //
+// Teks dan URL dipisah karena keduanya butuh perlakuan berbeda: Teks dirender
+// sebagai isi tombol (html/template meng-escape-nya), sedangkan URL sudah
+// di-encode untuk dipakai sebagai query string.
+type saranItem struct {
+	Teks string
+	URL  string
+}
+
+// renderSaran merender tombol pertanyaan lanjutan.
+//
+// Teks saran dikirim lewat query string, bukan hx-vals berisi JSON. Saran
+// berasal dari model dan bisa memuat tanda kutip; hx-vals='{"q":"…"}' akan
+// rusak karena html/template meng-escape kutip jadi &#34;, browser
+// meng-decode-nya kembali jadi kutip, dan JSON-nya jadi tidak sah. Query string
+// sudah terbukti dipakai koneksi SSE di tanya.html.
+//
+// Sama seperti renderSumber, markup-nya ada di template supaya kelas
+// Tailwind-nya ikut ter-build.
+func (s *Server) renderSaran(saran []string) string {
+	item := make([]saranItem, 0, len(saran))
+	for _, t := range saran {
+		item = append(item, saranItem{Teks: t, URL: url.QueryEscape(t)})
+	}
+
+	var b strings.Builder
+
+	if err := s.tmpl.ExecuteTemplate(&b, "saran", item); err != nil {
+		log.Printf("web: merender saran: %v", err)
+		return ""
+	}
+	return strings.TrimSpace(b.String())
+}
+
 // Setiap baris isi wajib punya awalan "data:" sendiri. Baris baru yang
 // dibiarkan mentah akan dipotong oleh browser, sehingga sisa isinya hilang —
 // dan HTML hasil render Markdown hampir selalu berisi baris baru.

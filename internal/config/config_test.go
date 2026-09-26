@@ -91,3 +91,48 @@ func TestChunkSizeTidakMasukAkalDilaporkan(t *testing.T) {
 		})
 	}
 }
+
+// TestSaranCountDefault mengunci jumlah tombol saran bawaan.
+//
+// Nilainya menentukan berapa panggilan model tambahan yang terjadi pada tiap
+// jawaban di client web, jadi mengubahnya tanpa sadar akan terasa sebagai
+// beban kuota yang berbeda.
+func TestSaranCountDefault(t *testing.T) {
+	t.Setenv("SARAN_COUNT", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.SaranCount != 3 {
+		t.Errorf("SaranCount = %d, mau 3", cfg.SaranCount)
+	}
+}
+
+// TestSaranCountNegatifJadiNol memastikan salah ketik tidak diam-diam
+// menghidupkan fitur.
+//
+// Sama seperti HISTORY_MESSAGES: satu nilai punya satu arti. Negatif
+// diperlakukan sebagai 0 (fitur mati), bukan dibiarkan lewat dan membuat
+// pemanggil menebak-nebak.
+func TestSaranCountNegatifJadiNol(t *testing.T) {
+	t.Setenv("SARAN_COUNT", "-2")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.SaranCount != 0 {
+		t.Errorf("SaranCount = %d, mau 0", cfg.SaranCount)
+	}
+}
+
+// TestSaranCountBukanAngkaDilaporkan memastikan salah ketik dilaporkan, bukan
+// diganti default diam-diam.
+func TestSaranCountBukanAngkaDilaporkan(t *testing.T) {
+	t.Setenv("SARAN_COUNT", "tiga")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() berhasil, mau error karena SARAN_COUNT bukan angka")
+	}
+}
