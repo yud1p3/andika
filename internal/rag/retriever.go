@@ -11,11 +11,23 @@ import (
 	qdrantclient "github.com/qdrant/go-client/qdrant"
 )
 
-// reRujukanPasal menangkap rujukan pasal di dalam pertanyaan: "pasal 1",
-// "Pasal 139", "pasal 89 ayat (2)".
+// reRujukanPasal menangkap rujukan pasal di dalam teks: "pasal 1", "Pasal
+// 139", "pasal 89 ayat (2)".
+//
+// Dipakai di dua tempat: membaca nomor pasal yang disebut di pertanyaan, dan
+// memindai isi pasal yang sudah terambil untuk menemukan rujukan silangnya
+// (lihat nomorRujukanSilang).
 //
 // Hanya nomornya yang diambil. Rujukan ke ayat atau huruf tidak dipakai untuk
 // menyaring, karena satu pasal jarang dipecah sampai ke tingkat itu.
+//
+// Polanya sengaja selebar \bpasal\s+(\d+) alih-alih mengunci frasa baku
+// "sebagaimana dimaksud dalam Pasal". Terukur pada dokumen contoh: frasa baku
+// menangkap 45 rujukan, pola longgar 49. Empat sisanya memakai frasa lain —
+// "sebagaimana dimaksud Pasal 27 huruf b", "sebagaimana dimaksud pada Pasal 106
+// huruf a", dan satu yang salah ketik ("dimaksudd alam Pasal 27") sehingga
+// tidak akan tertangkap frasa baku mana pun. Semuanya rujukan yang sah, jadi
+// mengetatkan pola di sini berarti kehilangan rujukan.
 var reRujukanPasal = regexp.MustCompile(`(?i)\bpasal\s+(\d+)`)
 
 // Kunci di dalam metadata potongan yang menyimpan nomor pasal. Nilainya
@@ -34,8 +46,9 @@ const kunciAsal = "asal"
 
 // Nilai untuk kunciAsal.
 const (
-	asalPasal  = "pasal"
-	asalVektor = "vektor"
+	asalPasal   = "pasal"
+	asalRujukan = "rujukan"
+	asalVektor  = "vektor"
 )
 
 // topKPasal adalah jumlah potongan yang diambil saat menyaring per pasal.
@@ -45,6 +58,15 @@ const (
 // seluruh isi satu pasal, dan kehilangan sebagiannya persis masalah yang
 // sedang diperbaiki di sini.
 const topKPasal = 20
+
+// maksRujukanSilang adalah jumlah maksimal pasal tambahan yang diikuti dari
+// rujukan silang dalam satu pencarian.
+//
+// Terukur pada dokumen contoh: tidak ada satu pun pasal yang merujuk lebih dari
+// satu pasal lain, jadi batas ini tidak pernah tercapai di sana. Batas tetap
+// dipasang untuk dokumen lain yang rujukannya lebih rapat — konteks yang
+// membanjir lebih merugikan jawaban daripada satu rujukan yang tidak diikuti.
+const maksRujukanSilang = 4
 
 // retrieverPasal melengkapi pencarian vektor dengan pencarian langsung
 // berdasarkan nomor pasal yang disebut di pertanyaan.
@@ -63,6 +85,9 @@ const topKPasal = 20
 // Penyaringan metadata menutup celah itu: begitu pertanyaan menyebut nomor
 // pasal, seluruh potongan pasal tersebut diambil langsung, tanpa bergantung
 // pada kedekatan vektor.
+//
+// Satu langkah lagi ditambahkan di atasnya: pasal yang terambil dipindai untuk
+// rujukan silangnya, lalu pasal yang dirujuk ikut diambil. Lihat ikutiRujukan.
 type retrieverPasal struct {
 	dasar retriever.Retriever
 }
@@ -73,7 +98,8 @@ func newRetrieverPasal(dasar retriever.Retriever) *retrieverPasal {
 }
 
 // Retrieve menjalankan pencarian vektor, lalu menambahkan seluruh potongan
-// pasal yang dirujuk di depan hasilnya.
+// pasal yang dirujuk di depan hasilnya — berikut pasal yang dirujuk oleh
+// pasal-pasal itu sendiri.
 //
 // Hasil penyaringan diletakkan di depan karena itulah yang ditanyakan. Hasil
 // vektor tetap disertakan di belakangnya supaya konteks lain — termasuk
@@ -103,10 +129,16 @@ func (r *retrieverPasal) Retrieve(ctx context.Context, query string, opts ...ret
 		return vektor, nil
 	}
 
+	lanjutan := r.ikutiRujukan(ctx, query, pasal, nomor, opts)
+
 	log.Printf("rag: rujukan pasal %v — %d potongan pasal diletakkan di depan %d hasil vektor",
 		nomor, len(pasal), len(vektor))
 
-	return r.gabung(pasal, vektor), nil
+	return r.gabung(
+		kelompok{pasal, asalPasal},
+		kelompok{lanjutan, asalRujukan},
+		kelompok{vektor, asalVektor},
+	), nil
 }
 
 // cariPerPasal mengambil seluruh potongan milik pasal-pasal yang disebut.
@@ -124,24 +156,31 @@ func (r *retrieverPasal) cariPerPasal(ctx context.Context, query string, nomor [
 	return r.dasar.Retrieve(ctx, query, opsi...)
 }
 
-// gabung menggabungkan hasil pasal dan hasil vektor, dengan hasil pasal lebih
-// dulu. Potongan yang muncul di keduanya hanya disimpan sekali.
+// kelompok adalah sekumpulan potongan beserta penanda asalnya, dipakai sebagai
+// masukan gabung.
+type kelompok struct {
+	docs []*schema.Document
+	asal string
+}
+
+// gabung menggabungkan kelompok potongan menurut urutan kepentingannya — yang
+// lebih dulu disebut lebih dulu — dan potongan yang muncul di beberapa
+// kelompok hanya disimpan sekali.
 //
 // Asal potongan ditandai di sini, pada saat pertama kali ia terlihat. Menandai
 // sebelum penggabungan akan salah untuk potongan yang ditemukan kedua cara:
 // penanda yang terakhir menimpanya.
-func (r *retrieverPasal) gabung(pasal, vektor []*schema.Document) []*schema.Document {
-	hasil := make([]*schema.Document, 0, len(pasal)+len(vektor))
-	dilihat := make(map[string]struct{}, len(pasal)+len(vektor))
+func (r *retrieverPasal) gabung(semua ...kelompok) []*schema.Document {
+	total := 0
+	for _, k := range semua {
+		total += len(k.docs)
+	}
 
-	for _, kelompok := range []struct {
-		docs []*schema.Document
-		asal string
-	}{
-		{pasal, asalPasal},
-		{vektor, asalVektor},
-	} {
-		for _, d := range kelompok.docs {
+	hasil := make([]*schema.Document, 0, total)
+	dilihat := make(map[string]struct{}, total)
+
+	for _, k := range semua {
+		for _, d := range k.docs {
 			if _, ada := dilihat[d.ID]; ada {
 				continue
 			}
@@ -150,13 +189,105 @@ func (r *retrieverPasal) gabung(pasal, vektor []*schema.Document) []*schema.Docu
 			if d.MetaData == nil {
 				d.MetaData = make(map[string]any, 1)
 			}
-			d.MetaData[kunciAsal] = kelompok.asal
+			d.MetaData[kunciAsal] = k.asal
 
 			hasil = append(hasil, d)
 		}
 	}
 
 	return hasil
+}
+
+// ikutiRujukan menelusuri rujukan silang satu lompatan dari potongan pasal
+// yang sudah terambil.
+//
+// Kenapa perlu. Terukur pada dokumen contoh: 49 dari 155 pasal (32%) memuat
+// rujukan ke pasal lain, dan rujukan itu bukan hiasan. Pertanyaan "Pasal 145
+// mengatur apa?" mengambil Pasal 145, sedangkan isi Pasal 145 menunjuk Pasal
+// 25 — dan Pasal 25 tidak ikut terambil, karena pencarian vektor tidak punya
+// alasan untuk mendekatkannya. Model lalu menjawab tanpa bahan yang justru
+// dirujuk. Hal yang sama terjadi pada "Pasal 33 mengatur apa?": Pasal 33
+// menyebut "Surat kuasa sebagaimana dimaksud Pasal 27 huruf b", sementara
+// Pasal 27 tidak ada di konteks.
+//
+// Satu lompatan saja. Rujukan dari pasal hasil ikutan tidak diikuti lagi:
+// setiap lompatan menambah satu perjalanan ke Qdrant dan memperbesar konteks,
+// sementara di dokumen contoh rujukan berantai tidak muncul — setiap pasal
+// merujuk paling banyak satu pasal lain.
+//
+// Hanya potongan dari kelompok pasal yang dipindai, bukan hasil vektor.
+// Potongan hasil vektor adalah pecahan yang bisa datang dari mana saja, dan
+// memindainya akan menarik pasal yang banyak dirujuk ke pertanyaan yang tidak
+// membutuhkannya. Terukur: pertanyaan "Apa itu lembar disposisi?" ikut
+// mengambil potongan Pasal 57 — yang menyebut "sebagaimana dimaksud dalam
+// Pasal 27 huruf n" — sehingga pemindaian hasil vektor akan menambahkan
+// seluruh enumerasi jenis naskah dinas ke pertanyaan tentang lembar disposisi,
+// padahal jawabannya sudah utuh di Pasal 24 dan Pasal 19.
+//
+// Kegagalan di sini tidak pernah menjatuhkan pencarian: yang dikembalikan
+// hanya potongan tambahan, dan pemanggil tetap memakai hasil pasal serta hasil
+// vektor apa adanya.
+func (r *retrieverPasal) ikutiRujukan(ctx context.Context, query string, pasal []*schema.Document, nomor []string, opts []retriever.Option) []*schema.Document {
+	rujukan := nomorRujukanSilang(pasal, nomor)
+	if len(rujukan) == 0 {
+		return nil
+	}
+
+	lanjutan, err := r.cariPerPasal(ctx, query, rujukan, opts)
+	if err != nil {
+		log.Printf("rag: menelusuri rujukan silang %v gagal, memakai hasil pasal saja: %v", rujukan, err)
+		return nil
+	}
+	if len(lanjutan) == 0 {
+		log.Printf("rag: rujukan silang %v tidak menghasilkan potongan", rujukan)
+		return nil
+	}
+
+	log.Printf("rag: rujukan silang dari pasal %v — pasal %v ikut diambil (%d potongan)",
+		nomor, rujukan, len(lanjutan))
+
+	return lanjutan
+}
+
+// nomorRujukanSilang mengumpulkan nomor pasal yang dirujuk oleh potongan yang
+// sudah terambil, tanpa pengulangan, tanpa menyebut pasalnya sendiri, dan
+// tidak lebih dari maksRujukanSilang.
+//
+// Rujukan ke pasal sendiri dibuang karena setiap potongan memuat nomor
+// pasalnya di header — "Pasal 89 ayat (1)-(2)" — sehingga tanpa penyaringan
+// ini setiap pasal akan dianggap merujuk dirinya sendiri.
+//
+// Urutannya mengikuti urutan potongan, jadi batas maksRujukanSilang memotong
+// rujukan yang paling belakang, bukan yang sembarang.
+func nomorRujukanSilang(docs []*schema.Document, sudahAda []string) []string {
+	terpakai := make(map[string]struct{}, len(sudahAda)+maksRujukanSilang)
+	for _, n := range sudahAda {
+		terpakai[n] = struct{}{}
+	}
+
+	var nomor []string
+	for _, d := range docs {
+		sendiri := bacaMetadata(d)[kunciPasal]
+
+		for _, m := range reRujukanPasal.FindAllStringSubmatch(d.Content, -1) {
+			n := m[1]
+			if n == sendiri {
+				continue
+			}
+			if _, ada := terpakai[n]; ada {
+				continue
+			}
+
+			terpakai[n] = struct{}{}
+			nomor = append(nomor, n)
+
+			if len(nomor) >= maksRujukanSilang {
+				return nomor
+			}
+		}
+	}
+
+	return nomor
 }
 
 // nomorPasalDirujuk mengumpulkan nomor pasal yang disebut di pertanyaan, tanpa

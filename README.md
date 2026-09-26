@@ -216,8 +216,9 @@ Collection : perbup_18_2025 | top-k: 10
     ayat=1 bab=III bab_judul=JENIS, SUSUNAN DAN BENTUK NASKAH DINAS pasal=31 …
 ```
 
-Penanda `[pasal]` dan `[vektor]` menunjukkan **mengapa** sebuah potongan ikut
-terambil — lihat [Rujukan pasal langsung](#rujukan-pasal-langsung).
+Penanda `[pasal]`, `[rujukan]`, dan `[vektor]` menunjukkan **mengapa** sebuah
+potongan ikut terambil — lihat
+[Rujukan pasal langsung](#rujukan-pasal-langsung).
 
 ### Format jawaban
 
@@ -365,6 +366,13 @@ pencarian vektor tetap mengembalikan `TOP_K` potongan di sampingnya — dan
 semuanya benar-benar ikut menyusun konteks. Yang menjawab selalu ada di depan,
 karena urutannya mengikuti peringkat.
 
+Pasal hasil penelusuran rujukan silang juga ikut muncul di daftar ini. Untuk
+pertanyaan *"Pasal 145 mengatur apa"*, rujukannya berbunyi **Pasal 145, Pasal
+25** — dan itu memang bahan yang dipakai model, karena isi Pasal 145 menunjuk
+ke Pasal 25. Kalau pembaca ingin tahu kenapa sebuah pasal yang tidak ia tanyakan
+ada di daftar, urutannya menjelaskan: yang pertama diminta, yang berikutnya
+dirujuk.
+
 Aliran datanya:
 
 ```
@@ -411,6 +419,15 @@ tanpa metadata tetap mendapat label yang masuk akal. Di `internal/web`: bahwa
 event `sumber` datang sebelum potongan jawaban pertama, bahwa ia tidak dikirim
 sama sekali kalau tidak ada rujukan, bahwa labelnya di-escape, dan bahwa tombol
 pertanyaan contoh benar-benar mengirim pertanyaannya.
+
+Penelusuran rujukan silang diuji tanpa API maupun Qdrant, lewat retriever palsu
+yang menjawab berbeda untuk tiap percobaan: bahwa rujukan diikuti dan pasal
+hasil ikutan ditandai `[rujukan]`, bahwa nomor pasal sendiri tidak dianggap
+rujukan, bahwa rujukan kembar dari dua pasal hanya diambil sekali, bahwa rujukan
+yang juga muncul di hasil vektor tidak digandakan dan tetap ditandai `[rujukan]`,
+bahwa batas jumlah ditegakkan, bahwa frasa tidak baku dan salah ketik tetap
+tertangkap, serta bahwa penelusuran yang gagal atau kosong tidak pernah
+menjatuhkan pencarian utama.
 
 Splitter sadar-struktur juga diuji tanpa API: bahwa tiap penanda pasal dikenali
 beserta judul BAB-nya, bahwa pasal pendek disimpan utuh tanpa header buatan,
@@ -735,7 +752,9 @@ Jadi begitu pertanyaan menyebut nomor pasal, potongan pasal itu diambil
 
 1. Pertanyaan dicocokkan dengan `(?i)\bpasal\s+(\d+)`.
 2. Kalau ada rujukan, Qdrant disaring dengan `metadata.pasal` = nomor tersebut.
-3. Hasil penyaringan diletakkan **di depan** hasil vektor, lalu digabung tanpa
+3. Pasal yang terambil dipindai untuk rujukan silangnya, lalu pasal yang
+   dirujuk ikut diambil — satu lompatan saja (lihat bagian berikutnya).
+4. Hasilnya diletakkan **di depan** hasil vektor, lalu digabung tanpa
    penggandaan.
 
 Beberapa nomor digabung dengan **ATAU**, jadi *"apa bedanya pasal 8 dan pasal
@@ -743,6 +762,49 @@ Beberapa nomor digabung dengan **ATAU**, jadi *"apa bedanya pasal 8 dan pasal
 
 Hasil akhirnya untuk pertanyaan yang memulai semua ini: **seluruh 17 definisi
 Pasal 1 ikut ke dalam konteks**, dan jawabannya menyebut ke-17-nya.
+
+### Mengikuti rujukan silang satu lompatan
+
+Pasal di peraturan ini saling menunjuk. Terukur pada dokumen contoh: **49 dari
+155 pasal (32%)** memuat rujukan ke pasal lain, dan rujukan itu bukan hiasan.
+
+| Pertanyaan | Sebelum | Sesudah |
+|---|---|---|
+| Pasal 145 mengatur apa | P145 | P145 + **P25** |
+| Pasal 33 mengatur apa | P33 | P33 + **P27** |
+| Pasal 89 ayat (2) berbunyi apa | P89 | P89 + **P87** |
+| Pasal 28 mengatur apa | P28 | P28 + **P27** |
+| Pasal 70 mengatur apa | P70 | P70 + **P27** |
+
+Pasal 145 menyebut *"sebagaimana dimaksud dalam Pasal 25"*, dan Pasal 25 tidak
+ikut terambil — pencarian vektor tidak punya alasan untuk mendekatkannya. Model
+lalu menjawab tanpa bahan yang justru dirujuk. Pasal 33 lebih tajam lagi: ia
+menyebut *"Surat kuasa sebagaimana dimaksud Pasal 27 huruf b"*, sementara Pasal
+27 adalah tempat daftar jenis naskah dinas berada.
+
+Empat hal yang membatasi langkah ini:
+
+| Batas | Alasan |
+|---|---|
+| **Satu lompatan** — rujukan dari pasal hasil ikutan tidak diikuti lagi | Setiap lompatan menambah satu perjalanan ke Qdrant dan memperbesar konteks. Di dokumen contoh rujukan berantai tidak muncul: setiap pasal merujuk paling banyak satu pasal lain |
+| **Maksimal 4 pasal** (`maksRujukanSilang`) | Batas ini tidak pernah tercapai di dokumen contoh, tetapi dipasang untuk dokumen lain yang rujukannya lebih rapat |
+| **Hanya memindai potongan pasal**, bukan hasil vektor | Potongan hasil vektor adalah pecahan dari mana saja. Terukur: *"Apa itu lembar disposisi?"* ikut mengambil potongan Pasal 57 yang menyebut *"Pasal 27 huruf n"* — pemindaian hasil vektor akan menambahkan seluruh enumerasi jenis naskah dinas ke pertanyaan yang jawabannya sudah utuh di Pasal 24 dan 19 |
+| **Nomor pasal sendiri dibuang** | Setiap potongan memuat nomornya di header — `Pasal 89 ayat (1)-(2)` — sehingga tanpa penyaringan ini setiap pasal dianggap merujuk dirinya sendiri |
+
+Polanya sengaja selebar `\bpasal\s+(\d+)`, bukan mengunci frasa baku. Frasa
+`sebagaimana dimaksud dalam Pasal` menangkap 45 rujukan; pola longgar 49. Empat
+sisanya memakai frasa lain, dan satu di antaranya salah ketik di dokumen sumber:
+
+```markdown
+Berita daerah sebagiamana dimaksudd alam Pasal 27 huruf u …
+```
+
+Rujukan itu tetap ikut ditelusuri, dan itulah yang membuat baris terakhir tabel
+di atas bekerja.
+
+Kalau penelusuran rujukan gagal — Qdrant menolak, atau pasal yang dirujuk tidak
+ada di collection — hasil pasal dan hasil vektor tetap dipakai apa adanya.
+Rujukan silang adalah tambahan, bukan syarat.
 
 ### Bekerja sama dengan memori percakapan
 
@@ -770,6 +832,8 @@ juga jatuh kembali ke hasil vektor, bukan gagal:
 | Pertanyaan tidak menyebut nomor pasal | hasil vektor saja, tanpa penandaan |
 | Nomor pasal tidak ada di dokumen | hasil vektor saja, tanpa penandaan |
 | Penyaringan ditolak Qdrant | hasil vektor saja, alasannya dicatat di log |
+| Rujukan silang tidak menghasilkan potongan | hasil pasal + hasil vektor, alasannya dicatat di log |
+| Penelusuran rujukan ditolak Qdrant | hasil pasal + hasil vektor, alasannya dicatat di log |
 
 Kegagalan penyaringan sengaja tidak menjatuhkan seluruh pencarian: hasil vektor
 sudah cukup untuk menjawab banyak pertanyaan, dan kehilangan konteks pasal
@@ -782,6 +846,8 @@ Setiap hasil diberi penanda asalnya:
 ```
 #1  skor 0.7168  [pasal]
     ayat=1-5 bab=I bab_judul=KETENTUAN UMUM bagian=batang_tubuh pasal=1 …
+#5  skor 0.4211  [rujukan]
+    ayat=1-3 bab=III bab_judul=JENIS, SUSUNAN DAN BENTUK NASKAH DINAS pasal=25 …
 #8  skor 0.7315  [vektor]
     ayat=1 bab=III bab_judul=JENIS, SUSUNAN DAN BENTUK NASKAH DINAS pasal=31 …
 ```
@@ -790,6 +856,13 @@ Setiap hasil diberi penanda asalnya:
 bukan karena mirip secara vektor. Skornya yang lebih rendah dari potongan
 `[vektor]` di bawahnya bukan tanda keliru — memang begitu keadaannya, dan itu
 sebabnya ia tidak akan pernah terambil tanpa penyaringan ini.
+
+`[rujukan]` berarti potongan itu ikut karena ada pasal di atasnya yang
+menunjuknya. Skornya paling rendah dari ketiganya, dan itu wajar: kemiripannya
+dengan pertanyaan tidak relevan, yang membuatnya relevan adalah rujukan
+silangnya. Kalau `[rujukan]` muncul padahal pertanyaan tidak menyebut pasal
+apa pun, berarti ada yang salah — penelusuran rujukan hanya dipicu dari
+potongan `[pasal]`.
 
 ---
 
@@ -1052,7 +1125,8 @@ rag-eino/
 │   │   └── pasal.go             splitter sadar-struktur (batas Pasal/BAB/Lampiran)
 │   ├── rag/
 │   │   ├── chain.go             jalur baca: condense + retriever + prompt + graph
-│   │   ├── retriever.go         tambahan: ambil langsung pasal yang disebut
+│   │   ├── retriever.go         tambahan: ambil langsung pasal yang disebut,
+│   │   │                        lalu ikuti rujukan silangnya satu lompatan
 │   │   ├── cari.go              retrieval saja, untuk memeriksa hasil pencarian
 │   │   ├── sumber.go            label rujukan potongan ("Pasal 7", "Lampiran")
 │   │   └── chain_test.go        verifikasi wiring, streaming, dan memori

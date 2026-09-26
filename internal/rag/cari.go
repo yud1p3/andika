@@ -26,8 +26,9 @@ type Temuan struct {
 	Peringkat int
 	Skor      float64
 	// Asal menunjukkan mengapa potongan ini ikut terambil: "pasal" kalau ia
-	// diambil karena nomor pasal yang disebut di pertanyaan, "vektor" kalau
-	// karena kemiripan makna. Kosong kalau retriever-nya tidak membedakan.
+	// diambil karena nomor pasal yang disebut di pertanyaan, "rujukan" kalau
+	// karena pasal yang sudah terambil merujuknya, "vektor" kalau karena
+	// kemiripan makna. Kosong kalau retriever-nya tidak membedakan.
 	Asal string
 	// Meta berisi metadata potongan apa adanya. Isinya bergantung pada
 	// strategi pemotongan yang dipakai saat ingest.

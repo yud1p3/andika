@@ -1,0 +1,16 @@
+# Berkas yang tidak perlu masuk graf pengetahuan codebase-memory.
+#
+# Sintaksnya sama dengan .gitignore. Berbeda dari .gitignore, berkas di sini
+# TETAP di-commit ke Git — yang dikecualikan hanya indeks grafnya.
+
+# Pustaka frontend yang di-vendor (htmx dan ekstensi SSE-nya).
+#
+# Keduanya berkas terminifikasi, dan pengurai membacanya sebagai ratusan simbol
+# pendek tanpa makna (`oe`, `ee`, `le`, `Ve`). Terukur: htmx.min.js sendiri
+# menyumbang 196 dari 845 node — 23% graf — sehingga ia mendominasi daftar
+# hotspot, membentuk klaster palsu, dan ikut muncul di hasil pencarian simbol.
+#
+# Yang dibutuhkan dari berkas ini hanyalah keberadaannya di repo, bukan
+# struktur internalnya: isinya dipakai lewat tag <script> di templates, bukan
+# dipanggil dari kode Go.
+internal/web/static/*.min.js

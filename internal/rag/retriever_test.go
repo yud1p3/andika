@@ -8,20 +8,24 @@ import (
 
 	"github.com/cloudwego/eino/components/retriever"
 	"github.com/cloudwego/eino/schema"
+	qdrantclient "github.com/qdrant/go-client/qdrant"
 )
 
-// retrieverRekam menjawab dua kali dengan daftar berbeda, dan mencatat setiap
-// panggilan.
+// retrieverRekam menjawab dengan daftar berbeda untuk tiap percobaan, dan
+// mencatat setiap panggilan.
 //
-// Percobaan pertama dianggap pencarian vektor biasa, percobaan kedua pencarian
-// per pasal. Pembedaan itu meniru perilaku retriever Qdrant, yang membedakan
-// keduanya hanya lewat opsi filter yang diterimanya.
+// Percobaan pertama dianggap pencarian vektor biasa, kedua pencarian per pasal,
+// dan ketiga pencarian pasal hasil penelusuran rujukan silang. Pembedaan itu
+// meniru perilaku retriever Qdrant, yang membedakan ketiganya hanya lewat opsi
+// filter yang diterimanya.
 type retrieverRekam struct {
-	hasilVektor []*schema.Document
-	hasilPasal  []*schema.Document
+	hasilVektor  []*schema.Document
+	hasilPasal   []*schema.Document
+	hasilRujukan []*schema.Document
 
-	errVektor error
-	errPasal  error
+	errVektor  error
+	errPasal   error
+	errRujukan error
 
 	queries []string
 	topK    []int
@@ -36,10 +40,14 @@ func (r *retrieverRekam) Retrieve(_ context.Context, query string, opts ...retri
 	co := retriever.GetCommonOptions(&retriever.Options{TopK: &acuan}, opts...)
 	r.topK = append(r.topK, *co.TopK)
 
-	if r.panggil == 1 {
+	switch r.panggil {
+	case 1:
 		return r.hasilVektor, r.errVektor
+	case 2:
+		return r.hasilPasal, r.errPasal
+	default:
+		return r.hasilRujukan, r.errRujukan
 	}
-	return r.hasilPasal, r.errPasal
 }
 
 // dok sederhana dengan ID tetap, supaya penggabungan bisa diperiksa.
@@ -48,6 +56,26 @@ func dok(id string) *schema.Document {
 		ID:       id,
 		Content:  "isi " + id,
 		MetaData: map[string]any{},
+	}
+}
+
+// dokPasal membangun potongan seperti yang dihasilkan internal/ingest: berisi
+// teks, dengan nomor pasal tersimpan di metadata berbentuk payload Qdrant.
+//
+// Bentuk metadata ini penting dan mudah salah. Metadata tidak disimpan sebagai
+// kunci tingkat atas, melainkan di bawah kunci "metadata", dan nilainya bertipe
+// *qdrant.Value — bukan *structpb.Value. Salah bentuk berarti bacaMetadata
+// mengembalikan nil tanpa error, dan seluruh test di bawahnya jadi tidak
+// menguji apa pun.
+func dokPasal(id, nomor, isi string) *schema.Document {
+	return &schema.Document{
+		ID:      id,
+		Content: isi,
+		MetaData: map[string]any{
+			kunciPayloadMetadata: map[string]*qdrantclient.Value{
+				kunciPasal: {Kind: &qdrantclient.Value_StringValue{StringValue: nomor}},
+			},
+		},
 	}
 }
 
@@ -349,6 +377,235 @@ func TestRetrieverPasalTidakMengubahOpsiPemanggil(t *testing.T) {
 		if got != 999 {
 			t.Errorf("slot %d di luar panjang opts ikut tertulis: topK menjadi %d, mau tetap 999", i, got)
 		}
+	}
+}
+
+// TestNomorRujukanSilang menguji pemindaian rujukan di dalam isi potongan.
+//
+// Yang paling mudah salah di sini adalah nomor pasal sendiri. Setiap potongan
+// memuat nomornya di header — "Pasal 89 ayat (1)-(2)" — jadi tanpa penyaringan
+// khusus setiap pasal akan dianggap merujuk dirinya sendiri.
+func TestNomorRujukanSilang(t *testing.T) {
+	for nama, kasus := range map[string]struct {
+		docs     []*schema.Document
+		sudahAda []string
+		mau      []string
+	}{
+		"tanpa rujukan": {
+			docs: []*schema.Document{dokPasal("a", "28", "Pasal 28 mengatur surat kuasa.")},
+		},
+		"pasal sendiri diabaikan": {
+			docs: []*schema.Document{dokPasal("a", "28", "Pasal 28 ayat (1)-(2) mengatur surat kuasa.")},
+		},
+		"rujukan tunggal": {
+			docs: []*schema.Document{dokPasal("a", "28", "Pasal 28 sebagaimana dimaksud dalam Pasal 27 huruf b")},
+			mau:  []string{"27"},
+		},
+		"rujukan kembar disatukan": {
+			docs: []*schema.Document{dokPasal("a", "28", "sebagaimana dimaksud dalam Pasal 27 dan Pasal 27 lagi")},
+			mau:  []string{"27"},
+		},
+		"nomor yang sudah diambil dilewati": {
+			docs:     []*schema.Document{dokPasal("a", "28", "sebagaimana dimaksud dalam Pasal 27")},
+			sudahAda: []string{"27", "28"},
+		},
+		"urutan mengikuti urutan potongan": {
+			docs: []*schema.Document{
+				dokPasal("a", "28", "sebagaimana dimaksud dalam Pasal 30"),
+				dokPasal("b", "28", "sebagaimana dimaksud dalam Pasal 12"),
+			},
+			mau: []string{"30", "12"},
+		},
+		"batas jumlah ditegakkan": {
+			docs: []*schema.Document{dokPasal("a", "28", "Pasal 1 Pasal 2 Pasal 3 Pasal 4 Pasal 5")},
+			mau:  []string{"1", "2", "3", "4"},
+		},
+		// Dokumen contoh memakai tiga frasa berbeda untuk rujukan yang sama,
+		// dan satu di antaranya salah ketik. Semuanya harus tertangkap.
+		"frasa tidak baku tetap tertangkap": {
+			docs: []*schema.Document{dokPasal("a", "33", "Surat kuasa sebagaimana dimaksud Pasal 27 huruf b")},
+			mau:  []string{"27"},
+		},
+		"salah ketik tetap tertangkap": {
+			docs: []*schema.Document{dokPasal("a", "70", "sebagiamana dimaksudd alam Pasal 27 huruf u")},
+			mau:  []string{"27"},
+		},
+	} {
+		t.Run(nama, func(t *testing.T) {
+			got := nomorRujukanSilang(kasus.docs, kasus.sudahAda)
+			if strings.Join(got, ",") != strings.Join(kasus.mau, ",") {
+				t.Errorf("nomorRujukanSilang() = %v, mau %v", got, kasus.mau)
+			}
+		})
+	}
+}
+
+// TestRetrieverPasalMengikutiRujukanSilang adalah perilaku inti penelusuran
+// rujukan silang.
+//
+// Pertanyaan yang menyebut Pasal 28 harus ikut membawa Pasal 27, karena isi
+// Pasal 28 menunjuk ke sana. Tanpa langkah ini Pasal 27 tidak akan pernah
+// terambil: pencarian vektor tidak punya alasan untuk mendekatkannya.
+func TestRetrieverPasalMengikutiRujukanSilang(t *testing.T) {
+	rekam := &retrieverRekam{
+		hasilVektor:  []*schema.Document{dok("v1")},
+		hasilPasal:   []*schema.Document{dokPasal("p28", "28", "Pasal 28 sebagaimana dimaksud dalam Pasal 27 huruf b")},
+		hasilRujukan: []*schema.Document{dokPasal("p27", "27", "Pasal 27 Jenis Naskah Dinas meliputi ...")},
+	}
+	r := newRetrieverPasal(rekam)
+
+	hasil, err := r.Retrieve(context.Background(), "pasal 28 mengatur apa")
+	if err != nil {
+		t.Fatalf("Retrieve() gagal: %v", err)
+	}
+
+	if rekam.panggil != 3 {
+		t.Fatalf("retriever dipanggil %d kali, mau 3 (vektor, pasal, rujukan)", rekam.panggil)
+	}
+	if rekam.topK[2] != topKPasal {
+		t.Errorf("percobaan rujukan memakai topK %d, mau %d", rekam.topK[2], topKPasal)
+	}
+
+	mau := []string{"p28", "p27", "v1"}
+	if got := idDokumen(hasil); strings.Join(got, ",") != strings.Join(mau, ",") {
+		t.Errorf("urutan hasil = %v, mau %v (pasal yang diminta, pasal rujukan, lalu vektor)", got, mau)
+	}
+
+	mauAsal := map[string]string{"p28": asalPasal, "p27": asalRujukan, "v1": asalVektor}
+	for _, d := range hasil {
+		if got := bacaAsal(d); got != mauAsal[d.ID] {
+			t.Errorf("potongan %s: asal = %q, mau %q", d.ID, got, mauAsal[d.ID])
+		}
+	}
+}
+
+// TestRetrieverPasalTidakMengikutiRujukanKeDirinyaSendiri menjaga penyaringan
+// nomor sendiri.
+//
+// Tanpa penyaringan ini, setiap pasal akan dianggap merujuk dirinya sendiri
+// karena nomornya ada di header, dan retriever akan memanggil Qdrant sekali
+// lagi hanya untuk mengambil pasal yang sama.
+func TestRetrieverPasalTidakMengikutiRujukanKeDirinyaSendiri(t *testing.T) {
+	rekam := &retrieverRekam{
+		hasilVektor: []*schema.Document{dok("v1")},
+		hasilPasal:  []*schema.Document{dokPasal("p89", "89", "Pasal 89 ayat (1)-(2) Ukuran amplop ...")},
+	}
+	r := newRetrieverPasal(rekam)
+
+	hasil, err := r.Retrieve(context.Background(), "pasal 89 ayat (2) berbunyi apa")
+	if err != nil {
+		t.Fatalf("Retrieve() gagal: %v", err)
+	}
+
+	if rekam.panggil != 2 {
+		t.Errorf("retriever dipanggil %d kali, mau 2 (tidak ada rujukan yang perlu diikuti)", rekam.panggil)
+	}
+	if got := idDokumen(hasil); strings.Join(got, ",") != "p89,v1" {
+		t.Errorf("hasil = %v, mau [p89 v1]", got)
+	}
+}
+
+// TestRetrieverPasalRujukanKembarDiambilSekali menjaga rujukan yang sama dari
+// beberapa pasal.
+//
+// Dua pasal yang sama-sama merujuk Pasal 27 — misalnya Pasal 28 dan Pasal 33 —
+// harus menghasilkan satu kali pengambilan, bukan dua.
+func TestRetrieverPasalRujukanKembarDiambilSekali(t *testing.T) {
+	rekam := &retrieverRekam{
+		hasilVektor: []*schema.Document{dok("v1")},
+		hasilPasal: []*schema.Document{
+			dokPasal("p28", "28", "sebagaimana dimaksud dalam Pasal 27 huruf b"),
+			dokPasal("p33", "33", "sebagaimana dimaksud dalam Pasal 27 huruf b"),
+		},
+		hasilRujukan: []*schema.Document{dokPasal("p27", "27", "Pasal 27 Jenis Naskah Dinas meliputi ...")},
+	}
+	r := newRetrieverPasal(rekam)
+
+	hasil, err := r.Retrieve(context.Background(), "apa isi pasal 28 dan pasal 33")
+	if err != nil {
+		t.Fatalf("Retrieve() gagal: %v", err)
+	}
+
+	if rekam.panggil != 3 {
+		t.Fatalf("retriever dipanggil %d kali, mau 3 (satu kali untuk rujukan kembar)", rekam.panggil)
+	}
+	if got := idDokumen(hasil); strings.Join(got, ",") != "p28,p33,p27,v1" {
+		t.Errorf("hasil = %v, mau [p28 p33 p27 v1]", got)
+	}
+}
+
+// TestRetrieverPasalRujukanMenangAtasHasilVektor menjaga potongan yang muncul
+// sebagai rujukan sekaligus sebagai hasil vektor.
+//
+// Ini bukan kasus buatan: pasal yang dirujuk sering juga terambil oleh
+// kemiripan makna. Yang lebih menjelaskan asalnya adalah "rujukan" — potongan
+// itu ada di situ karena ada pasal yang menunjuknya, bukan karena kebetulan
+// mirip.
+func TestRetrieverPasalRujukanMenangAtasHasilVektor(t *testing.T) {
+	rekam := &retrieverRekam{
+		hasilVektor:  []*schema.Document{dokPasal("p25", "25", "Pasal 25 ..."), dok("v1")},
+		hasilPasal:   []*schema.Document{dokPasal("p145", "145", "sebagaimana dimaksud dalam Pasal 25")},
+		hasilRujukan: []*schema.Document{dokPasal("p25", "25", "Pasal 25 ...")},
+	}
+	r := newRetrieverPasal(rekam)
+
+	hasil, err := r.Retrieve(context.Background(), "pasal 145 mengatur apa")
+	if err != nil {
+		t.Fatalf("Retrieve() gagal: %v", err)
+	}
+
+	if got := idDokumen(hasil); strings.Join(got, ",") != "p145,p25,v1" {
+		t.Errorf("hasil = %v, mau [p145 p25 v1]", got)
+	}
+	if got := bacaAsal(hasil[1]); got != asalRujukan {
+		t.Errorf("potongan p25: asal = %q, mau %q", got, asalRujukan)
+	}
+}
+
+// TestRetrieverPasalRujukanKosongDilewati menjaga rujukan yang tidak
+// menghasilkan potongan.
+//
+// Rujukan silang bisa menunjuk pasal yang tidak ada di vector store — misalnya
+// setelah dokumen sumber diperbarui tetapi collection belum di-ingest ulang.
+// Hasil pasal dan hasil vektor tetap dipakai apa adanya.
+func TestRetrieverPasalRujukanKosongDilewati(t *testing.T) {
+	rekam := &retrieverRekam{
+		hasilVektor: []*schema.Document{dok("v1")},
+		hasilPasal:  []*schema.Document{dokPasal("p28", "28", "sebagaimana dimaksud dalam Pasal 27")},
+	}
+	r := newRetrieverPasal(rekam)
+
+	hasil, err := r.Retrieve(context.Background(), "pasal 28 mengatur apa")
+	if err != nil {
+		t.Fatalf("Retrieve() gagal: %v", err)
+	}
+	if got := idDokumen(hasil); strings.Join(got, ",") != "p28,v1" {
+		t.Errorf("hasil = %v, mau [p28 v1]", got)
+	}
+}
+
+// TestRetrieverPasalErrorRujukanDilewati menjaga kegagalan penelusuran
+// rujukan.
+//
+// Rujukan silang adalah tambahan, bukan syarat. Kalau pencariannya gagal,
+// pencarian utama yang sudah berhasil tidak boleh ikut dibuang.
+func TestRetrieverPasalErrorRujukanDilewati(t *testing.T) {
+	rekam := &retrieverRekam{
+		hasilVektor: []*schema.Document{dok("v1")},
+		hasilPasal:  []*schema.Document{dokPasal("p28", "28", "sebagaimana dimaksud dalam Pasal 27")},
+		errRujukan:  errors.New("filter rujukan ditolak Qdrant"),
+	}
+	r := newRetrieverPasal(rekam)
+
+	hasil, err := r.Retrieve(context.Background(), "pasal 28 mengatur apa")
+	if err != nil {
+		t.Fatalf("Retrieve() mengembalikan error: %v; mau jatuh kembali ke hasil pasal", err)
+	}
+	if got := idDokumen(hasil); strings.Join(got, ",") != "p28,v1" {
+		t.Errorf("hasil = %v, mau [p28 v1]", got)
+	}
+	if got := bacaAsal(hasil[0]); got != asalPasal {
+		t.Errorf("asal = %q, mau %q", got, asalPasal)
 	}
 }
 
