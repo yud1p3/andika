@@ -1,0 +1,20 @@
+{
+  "name": "rag-eino-web",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Aset frontend untuk client web rag-eino (Tailwind + htmx)",
+  "scripts": {
+    "build:css": "tailwindcss -i internal/web/static/input.css -o internal/web/static/app.css --minify",
+    "watch:css": "tailwindcss -i internal/web/static/input.css -o internal/web/static/app.css --watch",
+    "vendor:js": "npm run vendor:htmx && npm run vendor:sse",
+    "vendor:htmx": "cp node_modules/htmx.org/dist/htmx.min.js internal/web/static/htmx.min.js",
+    "vendor:sse": "cp node_modules/htmx-ext-sse/dist/sse.min.js internal/web/static/sse.min.js"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "@tailwindcss/typography": "^0.5.16",
+    "htmx-ext-sse": "^2.2.4",
+    "htmx.org": "^2.0.11",
+    "tailwindcss": "^4.3.3"
+  }
+}

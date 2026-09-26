@@ -1,0 +1,26 @@
+# Rahasia — jangan pernah di-commit
+.env
+
+# Hasil unduhan dokumen. Berkasnya besar dan bisa dibuat ulang, jadi diabaikan.
+#
+# data/* dipakai, bukan data/, dengan sengaja: Git tidak bisa memasukkan kembali
+# sebuah berkas kalau direktori induknya dikecualikan, sehingga pola pengecualian
+# di bawah tidak akan berpengaruh.
+data/*
+*.pdf
+
+# Pengecualian untuk Markdown yang di-ingest. Ia bukan sekadar artefak turunan:
+# di dalamnya ada tambalan manual Pasal 89-90 (lihat README, "Mengganti
+# dokumen") yang tidak bisa dihasilkan ulang otomatis oleh xberg. Tanpa berkas
+# ini, clone baru kehilangan tambalan itu dan test penjaganya di
+# internal/ingest/pasal_test.go diam-diam ter-skip.
+!data/perbup_18_2025.md
+
+# Build artifact
+/rag
+/rag-eino
+
+# Dependensi frontend. package-lock.json tetap di-commit supaya versinya sama
+# di mesin lain; hasil build CSS (internal/web/static/app.css) juga di-commit
+# karena dibutuhkan go:embed saat kompilasi.
+node_modules/

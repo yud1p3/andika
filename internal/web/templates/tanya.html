@@ -1,0 +1,46 @@
+{{/*
+  Fragmen untuk satu pertanyaan.
+
+  hx-ext dan sse-connect sengaja berada di satu tag yang sama: dokumentasi htmx
+  mensyaratkan keduanya sepasang, bukan diwarisi dari elemen induk.
+
+  sse-close WAJIB ada. Ekstensi SSE htmx punya logika penyambungan ulang
+  otomatis dengan backoff, jadi tanpa penutup eksplisit koneksi akan dibuka
+  lagi setelah stream selesai — dan pertanyaan yang sama akan dijalankan ulang.
+  Event "tutup" sengaja dipisah dari "selesai" supaya penutupan koneksi tidak
+  berlomba dengan penukaran HTML terakhir.
+
+  show:bottom dipakai di kedua elemen yang menerima swap dari SSE. Isinya
+  bertambah terus selama jawaban mengalir, dan menambah isi tidak menggeser
+  posisi gulir — jadi tanpa show:bottom jawaban memanjang ke bawah layar dan
+  pembaca harus menggulir sendiri mengikuti tiap potongan.
+*/}}
+<article hx-ext="sse"
+         sse-connect="/tanya/alir?q={{.TanyaURL}}"
+         sse-close="tutup"
+         class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+
+  <p class="text-sm font-semibold text-slate-900">{{.Pertanyaan}}</p>
+
+  {{/*
+    Wadah jawaban. sse-swap="selesai" menukar isi elemen ini (innerHTML),
+    sehingga kelas prose di sini tetap bertahan sementara placeholder
+    "Mencari di dokumen…" dan teks yang sedang mengalir ikut tergantikan.
+  */}}
+  <div class="prose prose-slate prose-sm mt-3 max-w-none"
+       sse-swap="selesai" hx-swap="innerHTML show:bottom">
+    <p class="not-prose text-sm text-slate-500">Mencari di dokumen…</p>
+    <div class="not-prose mt-1 whitespace-pre-wrap text-sm text-slate-600"
+         sse-swap="delta" hx-swap="beforeend show:bottom"></div>
+  </div>
+
+  {{/*
+    Wadah rujukan, di luar wadah jawaban supaya penggantian isi jawaban tidak
+    menghapusnya. Event "sumber" datang sebelum potongan jawaban pertama, jadi
+    pembaca sudah tahu dasar jawabannya sementara teksnya masih mengalir.
+
+    Elemen ini sengaja kosong dan tanpa gaya sampai ada isinya; server tidak
+    mengirim event sama sekali kalau tidak ada yang bisa dirujuk.
+  */}}
+  <div sse-swap="sumber" hx-swap="innerHTML"></div>
+</article>

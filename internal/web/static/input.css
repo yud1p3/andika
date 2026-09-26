@@ -1,0 +1,29 @@
+/*
+ * Sumber CSS untuk Tailwind v4.
+ *
+ * Hasil build-nya (app.css) dipakai server lewat go:embed, jadi berkas itu ikut
+ * di-commit. Setiap kali kelas Tailwind di template berubah, jalankan:
+ *
+ *     npm run build:css
+ *
+ * Kalau lupa, kelas baru tidak akan punya gaya — gejalanya tampilan terlihat
+ * "setengah jadi" tanpa pesan error apa pun.
+ */
+
+/*
+ * source(none) mematikan pemindaian otomatis ke seluruh direktori proyek.
+ * Tanpa ini Tailwind ikut memindai berkas Go dan apa pun di akar proyek, yang
+ * memperlambat build dan bisa menghasilkan kelas palsu. Sumbernya didaftarkan
+ * eksplisit di bawah.
+ */
+@import "tailwindcss" source(none);
+
+/* Template HTML yang benar-benar memuat kelas Tailwind. */
+@source "../templates";
+
+/*
+ * Plugin typography memberi kelas `prose`, yang memberi gaya pada HTML hasil
+ * render Markdown (h1, ul, table, dst). Tanpa ini, preflight Tailwind
+ * menetralkan gaya bawaan elemen sehingga jawaban justru terlihat rata.
+ */
+@plugin "@tailwindcss/typography";

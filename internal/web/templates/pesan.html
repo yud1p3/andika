@@ -1,0 +1,42 @@
+{{/*
+  Pesan singkat yang disisipkan ke dalam #log.
+
+  Diletakkan di template, bukan sebagai string di dalam Go, karena Tailwind
+  hanya memindai direktori templates (lihat input.css). Kelas yang ditulis di
+  string Go tidak ikut ter-build, sehingga pesannya tampil tanpa gaya sama
+  sekali — tanpa pesan error apa pun saat build.
+*/}}
+
+{{/* Pemberitahuan biasa, misalnya setelah percakapan dikosongkan. */}}
+{{define "pesan-netral"}}
+<p class="not-prose rounded-lg bg-slate-200/70 px-3 py-2 text-sm text-slate-600">{{.}}</p>
+{{end}}
+
+{{/* Jawaban berhenti di tengah jalan. */}}
+{{define "pesan-galat"}}
+<p class="not-prose mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{{.}}</p>
+{{end}}
+
+{{/* Permintaan ditolak karena sesi yang sama masih melayani jawaban lain. */}}
+{{define "pesan-sibuk"}}
+<p class="not-prose text-sm text-slate-500">{{.}}</p>
+{{end}}
+
+{{/*
+  Daftar rujukan: bagian dokumen mana saja yang dipakai menyusun jawaban.
+
+  Dikirim sebagai event SSE tersendiri, bukan disisipkan ke teks jawaban, supaya
+  ia tidak ikut masuk ke riwayat percakapan. Kalau ikut, model akan melihatnya
+  pada giliran berikutnya sebagai bagian dari jawabannya sendiri.
+
+  Hanya label yang ditampilkan — "Pasal 7" — bukan isi potongannya. Pembaca
+  peraturan perlu tahu pasal mana yang harus dikutip, dan menampilkan isinya
+  akan mengulang jawaban di bawah jawaban.
+*/}}
+{{define "sumber"}}
+<div class="not-prose mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-3">
+  <span class="text-xs text-slate-400">Rujukan:</span>
+  {{range .}}<span class="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">{{.}}</span>
+  {{end}}
+</div>
+{{end}}
