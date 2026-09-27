@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"reflect"
 	"testing"
 	"time"
 
@@ -53,7 +54,7 @@ func (f *fakePenjawab) Stream(ctx context.Context, p rag.Pertanyaan) (*schema.St
 // diteruskan ke delta, dan rujukan sampai ke callback sumber.
 func TestAlirkanDariPenjawabMeneruskanDelta(t *testing.T) {
 	pj := &fakePenjawab{
-		potongan: []string{"satu ", "dua"},
+		potongan: []string{"Pasal 7 ", "mengatur surat kuasa."},
 		sumber:   []string{"Pasal 7"},
 	}
 
@@ -71,8 +72,8 @@ func TestAlirkanDariPenjawabMeneruskanDelta(t *testing.T) {
 		t.Fatalf("alirkan: %v", err)
 	}
 
-	if len(delta) != 2 || delta[0] != "satu " || delta[1] != "dua" {
-		t.Errorf("delta = %v, mau [satu  dua]", delta)
+	if len(delta) != 2 || delta[0] != "Pasal 7 " || delta[1] != "mengatur surat kuasa." {
+		t.Errorf("delta = %v, mau [Pasal 7  mengatur surat kuasa.]", delta)
 	}
 	if len(sumber) != 1 || sumber[0] != "Pasal 7" {
 		t.Errorf("sumber = %v, mau [Pasal 7]", sumber)
@@ -81,6 +82,81 @@ func TestAlirkanDariPenjawabMeneruskanDelta(t *testing.T) {
 	// Saran dimatikan (jumlahSaran=0), jadi salurannya harus sudah tertutup.
 	if _, ok := <-saluran; ok {
 		t.Error("saluran saran masih terbuka, mau tertutup karena SARAN_COUNT=0")
+	}
+}
+
+// TestAlirkanDariPenjawabMenyaringRujukan mengunci perbaikan yang memicu fitur
+// ini: daftar dari jalur baca memuat semua potongan yang pernah terambil —
+// di jalur agen bisa puluhan — tetapi yang sampai ke pemanggil hanya pasal
+// yang benar-benar disebut jawaban.
+func TestAlirkanDariPenjawabMenyaringRujukan(t *testing.T) {
+	pj := &fakePenjawab{
+		potongan: []string{"Berdasarkan Pasal 8, ada tiga jenis."},
+		sumber:   []string{"Pasal 7", "Pasal 8", "Pasal 145", "Pasal 94"},
+	}
+
+	alirkan := alirkanDariPenjawab(pj, nil, 6, 0, 0)
+
+	var sumber []string
+	if _, err := alirkan(context.Background(), "apa saja naskah dinas arahan?", nil,
+		func(string) error { return nil },
+		func(label []string) error { sumber = label; return nil },
+	); err != nil {
+		t.Fatalf("alirkan: %v", err)
+	}
+
+	mau := []string{"Pasal 8"}
+	if !reflect.DeepEqual(sumber, mau) {
+		t.Errorf("sumber = %v, mau %v", sumber, mau)
+	}
+}
+
+// TestAlirkanDariPenjawabTanpaSitasiTidakMengirimRujukan memastikan daftar
+// yang tidak dikutip jawaban tidak sampai ke pemanggil. Kalau tetap dikirim,
+// blok "Rujukan:" tampil tanpa satu pun label di belakangnya.
+func TestAlirkanDariPenjawabTanpaSitasiTidakMengirimRujukan(t *testing.T) {
+	pj := &fakePenjawab{
+		potongan: []string{"Jawaban yang tidak menyebut pasal mana pun."},
+		sumber:   []string{"Pasal 7", "Pasal 8"},
+	}
+
+	alirkan := alirkanDariPenjawab(pj, nil, 6, 0, 0)
+
+	dipanggil := false
+	if _, err := alirkan(context.Background(), "tanya", nil,
+		func(string) error { return nil },
+		func([]string) error { dipanggil = true; return nil },
+	); err != nil {
+		t.Fatalf("alirkan: %v", err)
+	}
+
+	if dipanggil {
+		t.Error("sumber dipanggil padahal jawaban tidak menyebut satu pun pasal")
+	}
+}
+
+// TestAlirkanDariPenjawabRujukanSetelahDelta mengunci urutan: rujukan baru
+// dikirim setelah potongan terakhir, karena penyaringannya butuh jawaban utuh.
+// Sebelumnya ia mendahului delta pertama.
+func TestAlirkanDariPenjawabRujukanSetelahDelta(t *testing.T) {
+	pj := &fakePenjawab{
+		potongan: []string{"Berdasarkan ", "Pasal 8, ada tiga jenis."},
+		sumber:   []string{"Pasal 8"},
+	}
+
+	alirkan := alirkanDariPenjawab(pj, nil, 6, 0, 0)
+
+	var urutan []string
+	if _, err := alirkan(context.Background(), "apa saja naskah dinas arahan?", nil,
+		func(string) error { urutan = append(urutan, "delta"); return nil },
+		func([]string) error { urutan = append(urutan, "sumber"); return nil },
+	); err != nil {
+		t.Fatalf("alirkan: %v", err)
+	}
+
+	mau := []string{"delta", "delta", "sumber"}
+	if !reflect.DeepEqual(urutan, mau) {
+		t.Errorf("urutan = %v, mau %v", urutan, mau)
 	}
 }
 

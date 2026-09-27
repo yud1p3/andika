@@ -38,6 +38,8 @@ import (
 // lepas.
 const systemInstruction = `Anda adalah AI yang dapat menjawab pertanyaan berdasarkan konteks dan pertanyaan dari user.
 Anda harus menjawab pertanyaan user, berdasarkan konteks.
+Sebutkan pasal yang menjadi sumber jawaban bila ada — misalnya "Berdasarkan
+Pasal 8". Pembaca peraturan perlu tahu pasal mana yang harus dikutip.
 Bila ada riwayat percakapan sebelumnya, pakai riwayat itu untuk memahami
 rujukan seperti "poin a di atas" atau "yang tadi". Jawaban tetap harus
 bersumber dari konteks dokumen, bukan dari riwayat.`
@@ -70,6 +72,10 @@ type Pertanyaan struct {
 	Riwayat []*schema.Message
 	// OnSumber dipanggil sekali setelah retrieval selesai, berisi label rujukan
 	// potongan yang dipakai menyusun konteks — mis. "Pasal 7". Boleh nil.
+	//
+	// Isinya adalah hasil retrieval apa adanya, bukan hanya yang akhirnya
+	// dikutip jawaban. Pemakai yang ingin menampilkan secukupnya menyaringnya
+	// dengan SaringSumber setelah jawabannya utuh — lihat sumber.go.
 	//
 	// Ditaruh di sini, bukan sebagai parameter Ask/Stream, karena hasil
 	// retrieval baru diketahui di tengah graph — node prepare yang

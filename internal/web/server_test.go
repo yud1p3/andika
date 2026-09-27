@@ -18,12 +18,18 @@ import (
 	"time"
 )
 
+// bacaPasalTetap adalah pembaca pasal palsu yang mengembalikan satu potongan
+// tetap, sehingga tes tidak menyentuh Qdrant.
+func bacaPasalTetap(_ context.Context, nomor string) ([]string, error) {
+	return []string{"Pasal " + nomor + " isi uji."}, nil
+}
+
 // newTestServer menyiapkan server dengan penjawab palsu, sehingga tes tidak
 // menyentuh Gemini maupun Qdrant.
 func newTestServer(t *testing.T, alirkan Alirkan) *Server {
 	t.Helper()
 
-	srv, err := New(alirkan, Tampilan{
+	srv, err := New(alirkan, bacaPasalTetap, Tampilan{
 		Title:      "Tanya Uji",
 		Subtitle:   "Sumber: dokumen uji",
 		Model:      "gemini-uji",
@@ -526,22 +532,23 @@ func TestAlirMengirimEventBertahap(t *testing.T) {
 	}
 }
 
-// TestAlirMengirimRujukanSebelumJawaban mengunci dua hal yang membuat rujukan
+// TestAlirMengirimRujukanSetelahJawaban mengunci dua hal yang membuat rujukan
 // berguna.
 //
 // Pertama, ia dikirim sebagai event tersendiri — bukan disisipkan ke teks
 // jawaban — sehingga tidak ikut masuk ke riwayat percakapan dan tidak terbaca
 // model sebagai bagian dari jawabannya sendiri pada giliran berikutnya.
 //
-// Kedua, ia datang sebelum potongan jawaban pertama, sehingga pembaca sudah
-// tahu dasar jawabannya sementara teksnya masih mengalir.
-func TestAlirMengirimRujukanSebelumJawaban(t *testing.T) {
+// Kedua, ia datang setelah potongan jawaban terakhir, tetapi tetap sebelum
+// koneksi ditutup. Rujukan baru bisa disaring setelah jawabannya utuh (lihat
+// rag.SaringSumber), jadi adapter mengirimnya di ujung aliran.
+func TestAlirMengirimRujukanSetelahJawaban(t *testing.T) {
 	alirkan := func(_ context.Context, _ string, _ []Pesan,
 		delta func(string) error, sumber func([]string) error) (SaluranSaran, error) {
-		if err := sumber([]string{"Pasal 7", "Lampiran"}); err != nil {
+		if err := delta("Jenis naskah dinas ada tiga."); err != nil {
 			return nil, err
 		}
-		return nil, delta("Jenis naskah dinas ada tiga.")
+		return nil, sumber([]string{"Pasal 7", "Lampiran"})
 	}
 
 	rec := panggil(t, newTestServer(t, alirkan), "/tanya/alir?q=x")
@@ -556,8 +563,16 @@ func TestAlirMengirimRujukanSebelumJawaban(t *testing.T) {
 	if iDelta < 0 {
 		t.Fatalf("tidak ada event delta:\n%s", isi)
 	}
-	if iSumber > iDelta {
-		t.Errorf("event sumber datang setelah delta (sumber=%d delta=%d):\n%s", iSumber, iDelta, isi)
+	if iSumber < iDelta {
+		t.Errorf("event sumber datang sebelum delta (sumber=%d delta=%d):\n%s", iSumber, iDelta, isi)
+	}
+
+	iTutup := strings.Index(isi, "event: tutup")
+	if iTutup < 0 {
+		t.Fatalf("tidak ada event tutup:\n%s", isi)
+	}
+	if iSumber > iTutup {
+		t.Errorf("event sumber datang setelah tutup (sumber=%d tutup=%d):\n%s", iSumber, iTutup, isi)
 	}
 
 	for _, label := range []string{"Pasal 7", "Lampiran"} {
@@ -765,6 +780,122 @@ func TestRujukanMengescapeLabel(t *testing.T) {
 	}
 }
 
+// TestSumberMenjadikanPasalTombol mengunci wiring tombol rujukan.
+//
+// Label pasal harus memuat hx-get ke /pasal dengan nomornya, dan menargetkan
+// wadah isi pasal di kartu yang sama lewat pemilih relatif. Label non-pasal
+// tetap label biasa — tidak punya nomor yang bisa diambil.
+func TestSumberMenjadikanPasalTombol(t *testing.T) {
+	srv := newTestServer(t, alirkanTetap("x"))
+
+	isi := srv.renderSumber([]string{"Pasal 7", "Lampiran"})
+
+	if !strings.Contains(isi, `hx-get="/pasal?nomor=7"`) {
+		t.Errorf("tombol pasal tidak mengarah ke /pasal:\n%s", isi)
+	}
+	if !strings.Contains(isi, `hx-target="next .isi-pasal"`) {
+		t.Errorf("tombol pasal tidak menargetkan wadah isi pasal:\n%s", isi)
+	}
+
+	// Hanya satu tombol: "Lampiran" tidak boleh ikut bisa diklik.
+	if n := strings.Count(isi, "hx-get="); n != 1 {
+		t.Errorf("jumlah tombol rujukan = %d, mau 1:\n%s", n, isi)
+	}
+	if !strings.Contains(isi, ">Lampiran<") {
+		t.Errorf("label Lampiran hilang:\n%s", isi)
+	}
+}
+
+// TestPasalMengembalikanIsi memastikan tombol rujukan benar-benar bisa memuat
+// isi pasal.
+func TestPasalMengembalikanIsi(t *testing.T) {
+	rec := panggil(t, newTestServer(t, alirkanTetap("x")), "/pasal?nomor=7")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, mau %d", rec.Code, http.StatusOK)
+	}
+
+	isi := rec.Body.String()
+	for _, wajib := range []string{"Pasal 7", "isi uji"} {
+		if !strings.Contains(isi, wajib) {
+			t.Errorf("fragmen tidak memuat %q:\n%s", wajib, isi)
+		}
+	}
+}
+
+// TestPasalNomorTidakSahDitolak menjaga nomor dari query string tidak pernah
+// diteruskan mentah-mentah.
+func TestPasalNomorTidakSahDitolak(t *testing.T) {
+	srv := newTestServer(t, alirkanTetap("x"))
+
+	for _, target := range []string{"/pasal", "/pasal?nomor=", "/pasal?nomor=abc", "/pasal?nomor=7x"} {
+		rec := panggil(t, srv, target)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("%s status = %d, mau %d", target, rec.Code, http.StatusBadRequest)
+		}
+	}
+}
+
+// TestPasalTidakDitemukanMembalasMarkup menjaga klik pada pasal yang tidak ada
+// tetap menampilkan pesan, bukan wadah kosong.
+//
+// Balasannya 200, bukan 404: htmx tidak menukar respons non-2xx, sehingga
+// status error justru membuat tombolnya terasa tidak bekerja.
+func TestPasalTidakDitemukanMembalasMarkup(t *testing.T) {
+	kosong := func(context.Context, string) ([]string, error) { return nil, nil }
+
+	srv, err := New(alirkanTetap("x"), kosong, Tampilan{Title: "uji"})
+	if err != nil {
+		t.Fatalf("membuat server: %v", err)
+	}
+
+	rec := panggil(t, srv, "/pasal?nomor=999")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, mau %d", rec.Code, http.StatusOK)
+	}
+	if isi := rec.Body.String(); !strings.Contains(isi, "tidak ditemukan") {
+		t.Errorf("tidak ada pesan pasal tidak ditemukan:\n%s", isi)
+	}
+}
+
+// TestPasalGagalDibacaMembalasMarkup memastikan kegagalan Qdrant tidak
+// menggagalkan halaman.
+func TestPasalGagalDibacaMembalasMarkup(t *testing.T) {
+	gagal := func(context.Context, string) ([]string, error) { return nil, errors.New("qdrant mati") }
+
+	srv, err := New(alirkanTetap("x"), gagal, Tampilan{Title: "uji"})
+	if err != nil {
+		t.Fatalf("membuat server: %v", err)
+	}
+
+	rec := panggil(t, srv, "/pasal?nomor=7")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, mau %d", rec.Code, http.StatusOK)
+	}
+	if isi := rec.Body.String(); !strings.Contains(isi, "gagal dimuat") {
+		t.Errorf("tidak ada pesan gagal dimuat:\n%s", isi)
+	}
+}
+
+// TestPasalTanpaPembacaMembalasMarkup menjaga server yang tidak punya pembaca
+// pasal — fitur detail dimatikan — tetap membalas markup.
+func TestPasalTanpaPembacaMembalasMarkup(t *testing.T) {
+	srv := newTestServer(t, alirkanTetap("x"))
+	srv.bacaPasal = nil
+
+	rec := panggil(t, srv, "/pasal?nomor=7")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, mau %d", rec.Code, http.StatusOK)
+	}
+	if isi := rec.Body.String(); !strings.Contains(isi, "tidak tersedia") {
+		t.Errorf("tidak ada pesan fitur mati:\n%s", isi)
+	}
+}
+
 // TestAlirMerenderMarkdown memastikan jawaban model yang berformat Markdown
 // sampai ke browser sebagai HTML, bukan sebagai penanda mentah.
 func TestAlirMerenderMarkdown(t *testing.T) {
@@ -940,6 +1071,8 @@ func TestKelasAdaDiCSS(t *testing.T) {
 		"halaman utama": panggil(t, srv, "/").Body.String(),
 		"blok rujukan":  srv.renderSumber([]string{"Pasal 7", "Lampiran"}),
 		"blok saran":    srv.renderSaran([]string{"Apa syaratnya?", "Berapa lama prosesnya?"}),
+		"isi pasal":     srv.renderPasal("7", []string{"Pasal 7 isi uji."}),
+		"pasal kosong":  srv.renderPasalKosong("Pasal 7 tidak ditemukan."),
 	}
 	for _, nama := range []string{"pesan-baru", "pesan-galat", "pesan-sibuk"} {
 		markup[nama] = srv.renderPesan(nama, "teks uji")

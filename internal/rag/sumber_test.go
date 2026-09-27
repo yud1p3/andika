@@ -77,3 +77,74 @@ func TestLabelSumberKosong(t *testing.T) {
 		t.Errorf("LabelSumber(nil) = %v, mau kosong", got)
 	}
 }
+
+// TestSaringSumberMenyisakanYangDisebut mengunci kasus yang memicu fitur ini:
+// jejak agen memuat banyak pasal, tetapi jawabannya hanya bersumber dari satu.
+func TestSaringSumberMenyisakanYangDisebut(t *testing.T) {
+	label := []string{"Pasal 7", "Pasal 8", "Pasal 145", "Pasal 94"}
+
+	got := SaringSumber(label, "Berdasarkan Pasal 8, Naskah Dinas arahan terdiri atas tiga jenis.")
+	mau := []string{"Pasal 8"}
+
+	if !reflect.DeepEqual(got, mau) {
+		t.Errorf("SaringSumber() = %v, mau %v", got, mau)
+	}
+}
+
+// TestSaringSumberTidakTertukarNomorSerupa menjaga batas kata pada nomor
+// pasal: jawaban yang menyebut "Pasal 89" tidak boleh dianggap menyebut
+// "Pasal 8".
+func TestSaringSumberTidakTertukarNomorSerupa(t *testing.T) {
+	if got := SaringSumber([]string{"Pasal 8"}, "sebagaimana dimaksud dalam Pasal 89"); len(got) != 0 {
+		t.Errorf("SaringSumber() = %v, mau kosong", got)
+	}
+
+	if got := SaringSumber([]string{"Pasal 8"}, "lihat Pasal 8 ayat (2)"); len(got) != 1 {
+		t.Errorf("SaringSumber() = %v, mau [Pasal 8]", got)
+	}
+}
+
+// TestSaringSumberTidakPekaHurufBesarKecil memastikan penyebutan pasal di
+// tengah kalimat tetap dikenali.
+func TestSaringSumberTidakPekaHurufBesarKecil(t *testing.T) {
+	if got := SaringSumber([]string{"Pasal 7"}, "menurut pasal 7, surat kuasa..."); len(got) != 1 {
+		t.Errorf("SaringSumber() = %v, mau [Pasal 7]", got)
+	}
+}
+
+// TestSaringSumberLabelNonPasal menutup label yang tidak punya nomor: ia lolos
+// hanya kalau bagiannya benar-benar disebut di jawaban.
+func TestSaringSumberLabelNonPasal(t *testing.T) {
+	label := []string{"Lampiran", "Pembukaan", "Dokumen"}
+
+	got := SaringSumber(label, "Formatnya dijelaskan di Lampiran.")
+	mau := []string{"Lampiran"}
+
+	if !reflect.DeepEqual(got, mau) {
+		t.Errorf("SaringSumber() = %v, mau %v", got, mau)
+	}
+}
+
+// TestSaringSumberMenjagaUrutan memastikan penyaringan tidak mengubah urutan
+// peringkat retrieval.
+func TestSaringSumberMenjagaUrutan(t *testing.T) {
+	label := []string{"Pasal 7", "Pasal 8", "Pasal 9"}
+
+	got := SaringSumber(label, "Pasal 9 dan Pasal 7 saling berkaitan.")
+	mau := []string{"Pasal 7", "Pasal 9"}
+
+	if !reflect.DeepEqual(got, mau) {
+		t.Errorf("SaringSumber() = %v, mau %v", got, mau)
+	}
+}
+
+// TestSaringSumberKosong menutup dua masukan kosong: tanpa label dan tanpa
+// jawaban. Keduanya berarti tidak ada yang bisa dirujuk.
+func TestSaringSumberKosong(t *testing.T) {
+	if got := SaringSumber(nil, "jawaban apa saja"); len(got) != 0 {
+		t.Errorf("SaringSumber(nil, ...) = %v, mau kosong", got)
+	}
+	if got := SaringSumber([]string{"Pasal 7"}, "   "); len(got) != 0 {
+		t.Errorf("SaringSumber(..., kosong) = %v, mau kosong", got)
+	}
+}

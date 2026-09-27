@@ -248,11 +248,15 @@ func runAsk(ctx context.Context, cfg *config.Config) error {
 
 		fmt.Printf("\n%s\n", renderMarkdown(answer, berGaya))
 
+		// Disaring dulu supaya yang tercetak hanya pasal yang benar-benar
+		// disebut jawaban: di jalur agen daftar mentahnya bisa memuat puluhan
+		// pasal yang tidak dipakai (lihat rag.SaringSumber).
+		//
 		// Dicetak setelah jawaban, bukan sebelumnya: di terminal tidak ada
 		// tempat menaruh rujukan di samping jawaban, dan mendahuluinya dengan
 		// daftar panjang justru menunda yang dicari pengguna.
-		if len(sumber) > 0 {
-			fmt.Printf("\nRujukan: %s\n", strings.Join(sumber, ", "))
+		if label := rag.SaringSumber(sumber, answer); len(label) > 0 {
+			fmt.Printf("\nRujukan: %s\n", strings.Join(label, ", "))
 		}
 
 		// Dicatat hanya setelah jawabannya berhasil. Pertanyaan yang gagal
@@ -422,18 +426,40 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 		batas = time.Duration(cfg.AgentTimeoutSeconds) * time.Second
 	}
 
-	srv, err := web.New(alirkanDariPenjawab(penjawab, ai.ChatModel, cfg.HistoryMessages, cfg.SaranCount, batas), web.Tampilan{
-		Title:      cfg.AppTitle,
-		Subtitle:   cfg.AppSubtitle,
-		Model:      cfg.ChatModel,
-		Collection: cfg.QdrantCollection,
-		TopK:       cfg.TopK,
-	})
+	// Pembaca isi pasal dipakai tombol rujukan di client web. Ia membaca
+	// langsung dari Qdrant berdasarkan nomor pasal, tanpa memanggil model
+	// embedding — lihat rag.PembacaPasal.
+	pembaca := rag.NewPembacaPasal(qc, cfg.QdrantCollection)
+
+	srv, err := web.New(
+		alirkanDariPenjawab(penjawab, ai.ChatModel, cfg.HistoryMessages, cfg.SaranCount, batas),
+		bacaPasalDari(pembaca),
+		web.Tampilan{
+			Title:      cfg.AppTitle,
+			Subtitle:   cfg.AppSubtitle,
+			Model:      cfg.ChatModel,
+			Collection: cfg.QdrantCollection,
+			TopK:       cfg.TopK,
+		})
 	if err != nil {
 		return err
 	}
 
 	return srv.Serve(ctx, *addr)
+}
+
+// bacaPasalDari menyambungkan rag.PembacaPasal ke tipe web.BacaPasal.
+//
+// Paket web tidak mengenal rag.PembacaPasal; ia hanya butuh potongan teksnya.
+// Sama seperti alirkanDariPenjawab, fungsi ini tempat kedua tipe bertemu.
+func bacaPasalDari(p *rag.PembacaPasal) web.BacaPasal {
+	return func(ctx context.Context, nomor string) ([]string, error) {
+		isi, err := p.Baca(ctx, nomor)
+		if err != nil {
+			return nil, err
+		}
+		return isi.Potongan, nil
+	}
 }
 
 // alirkanDariPenjawab menyambungkan Penjawab.Stream ke tipe web.Alirkan.
@@ -444,9 +470,17 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 // lapisan web tidak perlu tahu bedanya.
 //
 // Rujukan potongan disalurkan lewat sumber. Callback itu dipasang di
-// rag.Pertanyaan, bukan dipanggil setelah aliran habis, karena jalur baca baru
-// tahu potongan mana yang terpakai setelah retrieval berjalan — dan itu terjadi
-// di tengah aliran, sebelum potongan jawaban pertama tiba.
+// rag.Pertanyaan karena jalur baca baru tahu potongan mana yang terambil
+// setelah retrieval berjalan — dan itu terjadi di tengah graph. Pengirimannya
+// ke pemanggil, bagaimanapun, sengaja ditunda sampai aliran habis: label dari
+// jalur baca masih memuat semua potongan yang terambil, termasuk yang akhirnya
+// tidak dipakai menjawab, dan hanya setelah jawabannya utuh daftar itu bisa
+// disaring dengan rag.SaringSumber.
+//
+// Menampung label di variabel lokal — bukan menulis respons dari callback —
+// juga yang menjaga respons tetap ditulis satu goroutine: OnSumber menyala dari
+// goroutine graph, sedangkan respons hanya boleh ditulis dari goroutine yang
+// membaca aliran di bawah.
 //
 // Saran pertanyaan lanjutan disusun model kedua yang mulai bekerja begitu
 // retrieval selesai, bersamaan dengan jawaban. Hasilnya dikembalikan sebagai
@@ -478,17 +512,17 @@ func alirkanDariPenjawab(pj rag.Penjawab, cm model.BaseChatModel, historyMaks, j
 			defer batal()
 		}
 
+		// Label rujukan ditampung, bukan langsung dikirim: daftar dari jalur
+		// baca masih memuat semua potongan yang terambil, termasuk yang
+		// akhirnya tidak dipakai menjawab. Penyaringan baru bisa dilakukan
+		// setelah jawabannya utuh (lihat rag.SaringSumber).
+		var labelTertunda []string
+
 		sr, err := pj.Stream(alirCtx, rag.Pertanyaan{
 			Teks:    pertanyaan,
 			Riwayat: rag.PangkasRiwayat(keSchemaMessages(riwayat), historyMaks),
-			// Kesalahan dari sumber diabaikan di sini: yang dilaporkan ke
-			// pemanggil cukup satu error, dan kegagalan mengirim rujukan —
-			// biasanya karena klien memutus koneksi — akan muncul lagi pada
-			// delta pertama.
 			OnSumber: func(label []string) {
-				if err := sumber(label); err != nil {
-					log.Printf("rag: mengirim rujukan gagal: %v", err)
-				}
+				labelTertunda = label
 			},
 			// Konteks potongan tidak dikembalikan ke pemanggil — isinya bisa
 			// panjang dan tidak untuk ditampilkan. Ia hanya memicu penyusunan
@@ -500,14 +534,26 @@ func alirkanDariPenjawab(pj rag.Penjawab, cm model.BaseChatModel, historyMaks, j
 		}
 		defer sr.Close()
 
+		var jawaban strings.Builder
 		for {
 			potongan, err := sr.Recv()
 			if errors.Is(err, io.EOF) {
+				// Rujukan menyusul setelah potongan terakhir — hanya sekarang
+				// jawabannya utuh, dan hanya sekarang labelnya bisa disaring.
+				// Kegagalan mengirim rujukan diabaikan: yang dilaporkan ke
+				// pemanggil cukup satu error, dan biasanya itu klien yang
+				// memutus koneksi.
+				if label := rag.SaringSumber(labelTertunda, jawaban.String()); len(label) > 0 {
+					if err := sumber(label); err != nil {
+						log.Printf("rag: mengirim rujukan gagal: %v", err)
+					}
+				}
 				return saluran, nil
 			}
 			if err != nil {
 				return nil, err
 			}
+			jawaban.WriteString(potongan)
 			if err := delta(potongan); err != nil {
 				return nil, err
 			}

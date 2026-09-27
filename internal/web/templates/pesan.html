@@ -33,6 +33,10 @@
 {{/*
   Daftar rujukan: bagian dokumen mana saja yang dipakai menyusun jawaban.
 
+  Isinya sudah disaring server — hanya bagian yang penandanya disebut di
+  jawaban (lihat rag.SaringSumber) — sehingga daftar panjang hasil beberapa
+  pencarian agen tidak lagi bocor ke layar.
+
   Dikirim sebagai event SSE tersendiri, bukan disisipkan ke teks jawaban, supaya
   ia tidak ikut masuk ke riwayat percakapan. Kalau ikut, model akan melihatnya
   pada giliran berikutnya sebagai bagian dari jawabannya sendiri.
@@ -40,13 +44,55 @@
   Hanya label yang ditampilkan — "Pasal 7" — bukan isi potongannya. Pembaca
   peraturan perlu tahu pasal mana yang harus dikutip, dan menampilkan isinya
   akan mengulang jawaban di bawah jawaban.
+
+  Label pasal kini bisa diklik untuk memuat isi lengkapnya. Isinya sengaja
+  tidak ikut dikirim bersama event ini, melainkan diambil terpisah lewat
+  /pasal saat tombolnya benar-benar ditekan — halaman tetap ringan, dan pasal
+  yang tidak pernah dibuka tidak pernah ikut terkirim.
+
+  hx-target="next .isi-pasal": .isi-pasal adalah wadah di kartu jawaban yang
+  sama, tepat sesudah blok ini (lihat tanya.html). Pemilih relatif "next"
+  mencari elemen pertama yang cocok sesudah tombol, jadi tiap kartu jawaban
+  mendapat wadahnya sendiri tanpa perlu id unik.
+
+  Label non-pasal — "Lampiran", "Pembukaan", "Dokumen" — tidak punya nomor
+  yang bisa diambil, jadi tetap tampil sebagai label biasa.
 */}}
 {{define "sumber"}}
 <div class="not-prose mt-3 flex flex-wrap items-center gap-1.5 border-t border-slate-100 pt-3">
   <span class="text-xs text-slate-400">Rujukan:</span>
-  {{range .}}<span class="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">{{.}}</span>
+  {{range .}}{{if .Nomor}}<button type="button"
+      hx-get="/pasal?nomor={{.Nomor}}"
+      hx-target="next .isi-pasal"
+      hx-swap="innerHTML"
+      hx-disabled-elt="this"
+      class="rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600 transition hover:border-sky-400 hover:text-sky-700 disabled:opacity-50">{{.Label}}</button>
+  {{else}}<span class="rounded-md bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">{{.Label}}</span>
+  {{end}}{{end}}
+</div>
+{{end}}
+
+{{/*
+  Isi lengkap satu pasal, hasil tombol rujukan yang diklik.
+
+  Potongan sudah berupa HTML hasil render Markdown (server yang merendernya),
+  jadi di sini tinggal dibungkus. Judul kecilnya menegaskan pasal mana yang
+  sedang dibaca, karena wadahnya bisa tergantikan oleh klik pasal lain.
+*/}}
+{{define "pasal"}}
+<div class="not-prose mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
+  <p class="mb-2 text-xs font-semibold text-slate-500">Pasal {{.Nomor}}</p>
+  {{range .Potongan}}<div class="prose prose-slate prose-sm max-w-none">{{.}}</div>
   {{end}}
 </div>
+{{end}}
+
+{{/*
+  Pesan ketika isi pasal tidak bisa ditampilkan: pasal tidak ada di dokumen,
+  pembacaan gagal, atau fitur detail dimatikan di server.
+*/}}
+{{define "pasal-kosong"}}
+<p class="not-prose mt-2 rounded-lg bg-slate-100 px-3 py-2 text-sm text-slate-500">{{.Pesan}}</p>
 {{end}}
 
 {{/*

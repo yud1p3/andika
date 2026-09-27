@@ -254,8 +254,8 @@ benar-benar muncul di jawaban RAG yang ditangani. Tabel tidak dirapikan, dan
 garis bawah tunggal (`_miring_`) dibiarkan apa adanya supaya teks seperti
 `snake_case` tidak ikut berubah.
 
-Di bawah setiap jawaban, `rag ask` mencetak baris **Rujukan** berisi bagian
-dokumen yang dipakai — "Pasal 7, Pasal 31, …". Isinya sama dengan yang
+Di bawah setiap jawaban, `rag ask` mencetak baris **Rujukan** berisi pasal yang
+benar-benar dikutip jawaban — "Pasal 8, Pasal 31, …". Isinya sama dengan yang
 ditampilkan client web; lihat [Rujukan di bawah jawaban](#rujukan-di-bawah-jawaban).
 Dicetak setelah jawaban, bukan sebelumnya: di terminal tidak ada tempat menaruh
 rujukan di samping jawaban, dan mendahuluinya dengan daftar panjang justru
@@ -303,7 +303,7 @@ Pemindaian itu dibatasi ke direktori `templates/` (lihat `@source` di
 ter-build** — termasuk markup yang dibalas langsung oleh handler. Markup
 seperti itu sebaiknya diletakkan di template; lihat `templates/pesan.html`
 sebagai contoh. Test `TestKelasAdaDiCSS` menjaga hal ini untuk halaman utama,
-pesan singkat, dan blok rujukan.
+pesan singkat, blok rujukan, dan isi pasal.
 
 Bagaimana streaming-nya bekerja:
 
@@ -320,9 +320,10 @@ final hasil render Markdown yang menukar seluruh wadah jawaban), `saran`
 (tombol pertanyaan lanjutan, lihat di bawah), dan `tutup` (menutup koneksi).
 Event `tutup` sengaja dipisah: ekstensi SSE htmx punya penyambungan ulang
 otomatis, jadi tanpa penutup eksplisit pertanyaan akan dijalankan ulang setelah
-stream selesai. Urutannya `sumber → delta* → selesai → saran → tutup`; `saran`
-baru siap setelah jawaban habis, jadi ia menyusul di antara `selesai` dan
-`tutup`.
+stream selesai. Urutannya `delta* → sumber → selesai → saran → tutup`. `sumber`
+menyusul setelah potongan terakhir — daftar rujukannya baru bisa disaring setelah
+jawabannya utuh — dan `saran` baru siap setelah jawaban habis, jadi ia menyusul
+di antara `selesai` dan `tutup`.
 
 Kotak pertanyaan menempel di dasar layar: tinggi halaman dikunci ke tinggi layar
 (`h-dvh`) dan hanya daftar jawaban yang menggulir. Jawaban yang sedang mengalir
@@ -361,26 +362,40 @@ Berlaku di kedua antarmuka: `rag ask` mencetaknya sebagai baris teks, client web
 sebagai deretan label di bawah jawaban.
 
 Setiap jawaban disertai baris **Rujukan** berisi penanda bagian dokumen yang
-dipakai menyusunnya — "Pasal 7", "Lampiran", atau "Pembukaan".
+dikutip jawabannya — "Pasal 7", "Lampiran", atau "Pembukaan".
 
 Alasannya: pembaca peraturan tidak cukup tahu jawabannya, ia perlu tahu pasal
 mana yang harus dikutip. Tanpa itu, jawaban yang benar pun tidak bisa dipakai
 untuk bekerja.
 
 Rujukan diambil dari metadata potongan yang benar-benar terambil, **bukan dari
-teks jawaban model**. Bedanya penting: model bisa keliru menyebut pasal, dan
-rujukan yang dikarang model justru menyesatkan. Isi potongannya sendiri tidak
-ditampilkan — itu akan mengulang jawaban di bawah jawaban.
+teks jawaban model**: model bisa keliru menyebut pasal, dan rujukan yang
+dikarang model justru menyesatkan. Teks jawaban dipakai hanya sebagai
+**penyaring** — sebuah label bertahan kalau penandanya benar-benar disebut
+jawaban (`rag.SaringSumber`) — sehingga daftar tidak lagi memuat pasal yang
+terambil tapi tidak dipakai. Isi potongannya sendiri tidak ditampilkan langsung
+— itu akan mengulang jawaban di bawah jawaban — tetapi label pasalnya bisa
+diklik untuk membukanya; lihat
+[Isi pasal saat rujukan diklik](#isi-pasal-saat-rujukan-diklik).
 
 Urutannya mengikuti peringkat retrieval, dan label yang sama hanya muncul
 sekali: satu pasal sering terpecah menjadi beberapa potongan, dan menampilkan
 "Pasal 89" tujuh kali tidak menambah informasi apa pun.
 
-Perlu diketahui: ketika pertanyaan menyebut nomor pasal, daftar rujukannya bisa
-menjadi panjang. Penyaringan per pasal menambahkan isi pasal yang diminta, tapi
-pencarian vektor tetap mengembalikan `TOP_K` potongan di sampingnya — dan
-semuanya benar-benar ikut menyusun konteks. Yang menjawab selalu ada di depan,
-karena urutannya mengikuti peringkat.
+Penyaringan ini yang menutup masalah daftar rujukan yang memanjang di
+[Mode agen](#mode-agen-eksperimental). Jejak agen mengumpulkan potongan dari
+**setiap** panggilan tool selama satu permintaan, bukan hanya dari yang dipakai
+menjawab: dua kali `cari_vektor` dengan `TOP_K=10` bisa memunculkan sampai 20
+label. Terukur pada *"Apa saja yang termasuk Naskah Dinas arahan"*: 19 label
+mentah, dan setelah disaring tinggal **Pasal 8** — satu-satunya pasal yang
+dikutip jawaban.
+
+Batasan yang perlu diketahui: penyaringan bergantung pada model menyebut
+pasalnya. Model yang menjawab benar tanpa menyebut satu pun pasal akan
+kehilangan seluruh blok rujukan — itu sebabnya kedua jalur diminta menyebut
+pasal sumbernya (`systemInstruction` di jalur linear, `agenInstruction` di jalur
+agen). Rujukan yang hilang lebih baik daripada daftar panjang yang membuat
+pembaca salah sangka tentang apa yang benar-benar dipakai.
 
 Pasal hasil penelusuran rujukan silang juga ikut muncul di daftar ini. Untuk
 pertanyaan *"Pasal 145 mengatur apa"*, rujukannya berbunyi **Pasal 145, Pasal
@@ -392,15 +407,18 @@ dirujuk.
 Aliran datanya:
 
 ```
-retriever → rag.LabelSumber(docs) → rag.Pertanyaan.OnSumber
-          → web.Alirkan(sumber)    → event SSE "sumber"
+retriever → rag.LabelSumber(docs) → rag.Pertanyaan.OnSumber → label tertunda
+          → jawaban utuh → rag.SaringSumber → web.Alirkan(sumber)
+                                          → event SSE "sumber"
 ```
 
-`OnSumber` sengaja ditaruh di `rag.Pertanyaan`, bukan dipanggil setelah aliran
-habis: chain baru tahu potongan mana yang terpakai setelah node retrieval
-berjalan, dan itu terjadi di tengah graph. Rujukan pun sampai ke layar sebelum
-potongan jawaban pertama, jadi pembaca sudah tahu dasarnya sementara teksnya
-masih mengalir.
+`OnSumber` sengaja ditaruh di `rag.Pertanyaan`, bukan dikembalikan `Ask`/`Stream`:
+jalur baca baru tahu potongan mana yang terambil setelah node retrieval
+berjalan, dan itu terjadi di tengah graph. Tetapi pengirimannya ke layar sengaja
+ditunda sampai potongan terakhir — itulah satu-satunya saat labelnya bisa
+disaring dengan `rag.SaringSumber`. Penundaan itu sekaligus menjaga respons
+ditulis satu goroutine: `OnSumber` menyala dari goroutine graph, sedangkan
+respons hanya boleh ditulis dari goroutine yang membaca aliran.
 
 Rujukan dikirim sebagai event tersendiri, bukan disisipkan ke teks jawaban,
 supaya ia **tidak ikut masuk ke riwayat percakapan**. Kalau ikut, model akan
@@ -415,6 +433,58 @@ Batasan yang perlu diketahui:
 - Cookie sesi hanya menandai percakapan, bukan pengaman: **tidak ada
   autentikasi**, jadi siapa pun yang bisa menjangkau server ini bisa memulai
   percakapan baru.
+
+#### Isi pasal saat rujukan diklik
+
+Label rujukan yang berbentuk nomor pasal — "Pasal 7" — adalah tombol. Klik-nya
+memuat isi lengkap pasal itu dan menampilkannya di panel kecil di bawah baris
+rujukan, di kartu jawaban yang sama. Klik pasal lain mengganti isi panel itu.
+
+Label yang bukan pasal — "Lampiran", "Pembukaan", "Dokumen" — tetap label biasa:
+tidak ada nomor yang bisa diambil untuknya.
+
+Aliran datanya:
+
+```
+tombol "Pasal 7" → hx-get /pasal?nomor=7 → web.handlePasal
+                 → rag.PembacaPasal.Baca (Qdrant Scroll, filter metadata.pasal)
+                 → urutkan potongan → template "pasal" → .isi-pasal
+```
+
+Isi pasal **tidak** ikut dikirim bersama jawaban. Kalau ikut, halaman akan
+membawa seluruh isi setiap pasal yang dirujuk, padahal pembaca belum tentu
+membukanya. Yang dikirim hanya label; isinya diambil saat tombolnya benar-benar
+ditekan. Tombolnya menargetkan wadah `.isi-pasal` lewat pemilih relatif
+`hx-target="next .isi-pasal"`, jadi tiap kartu jawaban punya wadahnya sendiri
+tanpa perlu id unik.
+
+`PembacaPasal` (`internal/rag/pembaca_pasal.go`) sengaja tidak memakai
+pencarian vektor. Yang dicari bukan potongan yang paling mirip, melainkan
+seluruh isi pasal bernomor tertentu, dan nomornya sudah cukup: filter
+`metadata.pasal` mengembalikan tepat potongan-potongan pasal itu. Karena tidak
+ada query yang perlu di-embed, klik rujukan **tidak memakai kuota embedding
+Gemini** — penting karena tombolnya bisa diklik berkali-kali.
+
+Scroll Qdrant tidak menjamin urutan, jadi potongan diurutkan kembali dari header
+buatan yang selalu dipasang ingest di awal potongan hasil pemecahan: `Pasal 7
+ayat (3)`, `Pasal 7 (bagian 2/5)`, atau `Pasal 7 ayat (5), bagian 2/5`. Pasal
+yang muat utuh tidak berheader dan hanya punya satu potongan, jadi tidak ada
+yang perlu diurutkan.
+
+Batasan yang perlu diketahui:
+
+- Hanya label pasal yang bisa diklik; Lampiran dan Pembukaan tidak.
+- Urutan potongan bersandar pada format header ingest. Kalau `headerPasal` di
+  `internal/ingest/pasal.go` berubah, `kunciUrutan` di `pembaca_pasal.go` ikut
+  perlu disesuaikan.
+- Filter hanya melihat nomor pasal, bukan dokumen: dua dokumen berbeda di
+  collection yang sama yang memakai nomor pasal sama akan tercampur.
+- Jumlah potongan per pasal dibatasi (`maksPotonganPasal`).
+- Pasal panjang yang dipecah berdasarkan ukuran — bukan ayat — dibuat dengan
+  tumpang tindih (`CHUNK_OVERLAP`), jadi sebagian kecil isinya bisa tampak
+  berulang di batas potongan.
+- Kalau `BacaPasal` tidak dipasang (nil), tombolnya tetap tampil tetapi
+  membalas pesan bahwa isi pasal tidak tersedia.
 
 #### Saran pertanyaan lanjutan
 
@@ -450,10 +520,10 @@ lebih panjang dari yang perlu.
 Aliran datanya:
 
 ```
-retriever → rag.LabelSumber(docs) → OnSumber  → event SSE "sumber"
+retriever → rag.LabelSumber(docs) → OnSumber  → label tertunda
           → rag.formatDocs(docs)  → OnKonteks → goroutine cmd/rag → rag.Saran
                                                    │ (bersamaan jawaban)
-jawaban   → delta* → selesai ──────────────────────┤
+jawaban   → delta* → rag.SaringSumber → sumber → selesai ──────────┤
                                                    ▼
                        handleAlir tunggu saluran → event SSE "saran" → "tutup"
 ```
@@ -507,11 +577,14 @@ memerlukan API key maupun jaringan.
 
 Rujukan juga diuji di dua lapis, tanpa API. Di `internal/rag`: bahwa nomor pasal
 diutamakan sebagai label, bahwa potongan tanpa pasal jatuh ke nama bagiannya,
-bahwa label kembar dibuang tanpa mengubah urutan peringkat, dan bahwa dokumen
-tanpa metadata tetap mendapat label yang masuk akal. Di `internal/web`: bahwa
-event `sumber` datang sebelum potongan jawaban pertama, bahwa ia tidak dikirim
-sama sekali kalau tidak ada rujukan, bahwa labelnya di-escape, dan bahwa tombol
-pertanyaan contoh benar-benar mengirim pertanyaannya.
+bahwa label kembar dibuang tanpa mengubah urutan peringkat, bahwa dokumen tanpa
+metadata tetap mendapat label yang masuk akal, dan bahwa penyaringan hanya
+menyisakan label yang disebut jawaban — termasuk tidak tertukarnya "Pasal 8"
+dengan "Pasal 89", dan label non-pasal yang tetap lolos bila bagiannya disebut.
+Di `internal/web`: bahwa event `sumber` datang setelah potongan jawaban terakhir
+tapi sebelum `tutup`, bahwa ia tidak dikirim sama sekali kalau tidak ada
+rujukan, bahwa labelnya di-escape, dan bahwa tombol pertanyaan contoh benar-benar
+mengirim pertanyaannya.
 
 Penelusuran rujukan silang diuji tanpa API maupun Qdrant, lewat retriever palsu
 yang menjawab berbeda untuk tiap percobaan: bahwa rujukan diikuti dan pasal
@@ -1001,10 +1074,13 @@ penanda; `rag serve` tidak berubah tampilannya.
 | `baca_pasal` | `nomor` | mengambil seluruh isi satu pasal yang disebut |
 | `ikuti_rujukan` | `nomor` | menelusuri pasal yang dirujuk silang oleh suatu pasal |
 
-Ketiganya mengembalikan potongan beserta label pasalnya, dan potongan yang
-terkumpul dari **semua** tool digabung untuk menyusun rujukan di bawah jawaban
-serta saran pertanyaan lanjutan. Callback-nya tetap menyala sekali, sama seperti
-di jalur linear.
+Ketiganya mengembalikan potongan beserta label pasalnya. Potongan yang terkumpul
+dari **semua** tool digabung menjadi satu kumpulan bukti, dan kumpulan itulah
+yang menyusun saran pertanyaan lanjutan. Untuk rujukan di bawah jawaban,
+kumpulan yang sama disaring dulu dengan `rag.SaringSumber` supaya hanya pasal
+yang disebut jawaban yang tampil — tanpa itu, satu pertanyaan yang memanggil
+`cari_vektor` dua kali bisa memunculkan sampai `2 × TOP_K` label. Callback-nya
+tetap menyala sekali, sama seperti di jalur linear.
 
 Setiap pemanggilan tool dicatat ke log, sehingga jejak agen bisa dibaca sama
 seperti jalur linear:
@@ -1372,6 +1448,7 @@ rag-eino/
 │   │   ├── cari.go              retrieval saja, untuk memeriksa hasil pencarian
 │   │   ├── saran.go             saran pertanyaan lanjutan (web saja)
 │   │   ├── sumber.go            label rujukan potongan ("Pasal 7", "Lampiran")
+│   │   ├── pembaca_pasal.go     isi lengkap satu pasal (tombol rujukan web)
 │   │   └── *_test.go            verifikasi wiring, streaming, memori, dan agen
 │   └── web/
 │       ├── server.go            handler HTTP + SSE + sesi percakapan

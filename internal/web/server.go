@@ -29,6 +29,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,10 +106,10 @@ type SaluranSaran <-chan []string
 // biasanya karena klien memutus koneksi — Alirkan sebaiknya berhenti dan
 // mengembalikan error itu.
 //
-// sumber dipanggil sekali dengan label rujukan potongan yang dipakai — mis.
-// "Pasal 7" — sebelum delta pertama. Boleh tidak dipanggil sama sekali kalau
-// tidak ada yang bisa dirujuk. Error dari sumber diperlakukan sama seperti
-// error dari delta.
+// sumber dipanggil sekali dengan label rujukan yang benar-benar dikutip
+// jawaban — mis. "Pasal 7" — setelah potongan terakhir dan sebelum Alirkan
+// kembali. Boleh tidak dipanggil sama sekali kalau tidak ada yang bisa
+// dirujuk. Error dari sumber diperlakukan sama seperti error dari delta.
 //
 // Jawaban utuh tidak dikembalikan karena handler sudah menyusunnya sendiri dari
 // potongan yang benar-benar dikirim ke layar. Dengan begitu HTML final dijamin
@@ -128,6 +129,29 @@ type Alirkan func(
 	sumber func([]string) error,
 ) (SaluranSaran, error)
 
+// BacaPasal mengambil isi potongan satu pasal, sudah terurut sesuai urutan
+// dokumen. nomor berisi angka tanpa kata "Pasal", mis. "7".
+//
+// Nil berarti fitur "tampilkan isi pasal" dimatikan: tombol rujukan tetap
+// dirender, tetapi klik-nya berakhir dengan pesan bahwa isi pasal tidak
+// tersedia — bukan error di tengah halaman.
+//
+// Sama seperti Alirkan, ini seam supaya paket web tidak perlu tahu apa-apa
+// tentang Qdrant maupun cara potongan disimpan.
+type BacaPasal func(ctx context.Context, nomor string) ([]string, error)
+
+// Pola nomor pasal. Dipakai di dua tempat: memvalidasi nomor dari query string,
+// dan mengenali label rujukan "Pasal 7" yang boleh diklik.
+var (
+	// reNomorPasal membatasi nomor pada deretan angka, supaya nilai apa pun
+	// dari query string tidak pernah sampai ke Qdrant mentah-mentah.
+	reNomorPasal = regexp.MustCompile(`^\d+$`)
+	// reLabelPasal cocok dengan label rujukan yang berasal dari nomor pasal.
+	// Label lain — "Lampiran", "Pembukaan", "Dokumen" — tidak punya nomor
+	// yang bisa diambil, jadi tetap ditampilkan sebagai label biasa.
+	reLabelPasal = regexp.MustCompile(`^Pasal (\d+)$`)
+)
+
 // Tampilan adalah keterangan yang dipajang di kepala halaman.
 type Tampilan struct {
 	// Title dan Subtitle diisi dari konfigurasi, bukan ditulis di template,
@@ -145,6 +169,20 @@ type dataTanya struct {
 	// TanyaURL adalah pertanyaan yang sudah di-encode untuk dipakai sebagai
 	// query string koneksi SSE.
 	TanyaURL string
+}
+
+// dataPasal adalah isi fragmen untuk isi lengkap satu pasal.
+type dataPasal struct {
+	Nomor string
+	// Potongan sudah berupa HTML hasil render Markdown, jadi tipenya
+	// template.HTML supaya html/template tidak meng-escape-nya untuk kedua
+	// kalinya.
+	Potongan []template.HTML
+}
+
+// dataPasalKosong adalah pesan ketika isi pasal tidak bisa ditampilkan.
+type dataPasalKosong struct {
+	Pesan string
 }
 
 // sesi menyimpan riwayat percakapan satu pengunjung.
@@ -229,11 +267,12 @@ func (s *sesi) kosongkan() {
 
 // Server menyajikan halaman tanya-jawab.
 type Server struct {
-	alirkan  Alirkan
-	tampilan Tampilan
-	tmpl     *template.Template
-	md       goldmark.Markdown
-	statik   http.Handler
+	alirkan   Alirkan
+	bacaPasal BacaPasal
+	tampilan  Tampilan
+	tmpl      *template.Template
+	md        goldmark.Markdown
+	statik    http.Handler
 
 	// waktuTungguSaran membatasi berapa lama handleAlir menunggu saran
 	// setelah jawaban selesai. Lihat tungguSaranDefault.
@@ -244,8 +283,11 @@ type Server struct {
 	sesi map[string]*sesi
 }
 
-// New menyiapkan server dari fungsi penjawab dan keterangan tampilan.
-func New(alirkan Alirkan, tampilan Tampilan) (*Server, error) {
+// New menyiapkan server dari fungsi penjawab, pembaca pasal, dan keterangan
+// tampilan.
+//
+// bacaPasal boleh nil; lihat catatan pada BacaPasal.
+func New(alirkan Alirkan, bacaPasal BacaPasal, tampilan Tampilan) (*Server, error) {
 	tmpl, err := template.ParseFS(aset, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("membaca template: %w", err)
@@ -266,6 +308,7 @@ func New(alirkan Alirkan, tampilan Tampilan) (*Server, error) {
 		statik:           http.FileServerFS(statik),
 		waktuTungguSaran: tungguSaranDefault,
 		sesi:             make(map[string]*sesi),
+		bacaPasal:        bacaPasal,
 	}, nil
 }
 
@@ -350,6 +393,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 	mux.HandleFunc("GET /tanya", s.handleTanya)
 	mux.HandleFunc("GET /tanya/alir", s.handleAlir)
+	mux.HandleFunc("GET /pasal", s.handlePasal)
 	mux.HandleFunc("POST /baru", s.handleBaru)
 	mux.Handle("GET /statik/", http.StripPrefix("/statik/", s.statik))
 
@@ -464,16 +508,59 @@ func (s *Server) handleTanya(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handlePasal mengembalikan fragmen berisi isi lengkap satu pasal.
+//
+// Dipanggil htmx saat tombol rujukan "Pasal N" diklik. Selalu membalas 200
+// dengan markup — termasuk ketika pasal tidak ditemukan — karena htmx tidak
+// menukar respons non-2xx: status error justru membuat tombolnya terasa tidak
+// bekerja. Nomor yang tidak sah tetap 400, karena itu permintaan yang tidak
+// pernah dibuat tombol kita.
+func (s *Server) handlePasal(w http.ResponseWriter, r *http.Request) {
+	nomor := strings.TrimSpace(r.URL.Query().Get("nomor"))
+	if !reNomorPasal.MatchString(nomor) {
+		http.Error(w, "nomor pasal tidak sah", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+
+	tulis := func(isi string) {
+		if _, err := io.WriteString(w, isi); err != nil {
+			log.Printf("web: membalas isi pasal %s: %v", nomor, err)
+		}
+	}
+
+	if s.bacaPasal == nil {
+		tulis(s.renderPasalKosong("Isi pasal tidak tersedia pada server ini."))
+		return
+	}
+
+	potongan, err := s.bacaPasal(r.Context(), nomor)
+	if err != nil {
+		log.Printf("web: membaca pasal %s gagal: %v", nomor, err)
+		tulis(s.renderPasalKosong("Isi pasal gagal dimuat."))
+		return
+	}
+	if len(potongan) == 0 {
+		tulis(s.renderPasalKosong(fmt.Sprintf("Pasal %s tidak ditemukan di dokumen.", nomor)))
+		return
+	}
+
+	tulis(s.renderPasal(nomor, potongan))
+}
+
 // handleAlir mengalirkan jawaban sebagai Server-Sent Events.
 //
 // Urutan event yang dikirim:
 //
-//	sumber     label rujukan potongan, sebelum delta pertama
 //	delta  …   potongan teks mentah, ditambahkan ke layar
+//	sumber     label rujukan potongan, setelah potongan terakhir
 //	selesai    HTML final hasil render Markdown, menukar seluruh wadah jawaban
 //	saran      tombol pertanyaan lanjutan, disusun bersamaan dengan jawaban
 //	tutup      memicu sse-close di klien
 //
+// "sumber" menyusul di ujung aliran, bukan mendahului delta pertama, karena
+// labelnya baru bisa disaring setelah jawabannya utuh — lihat rag.SaringSumber.
 // "tutup" dipisah dari "selesai" supaya penutupan koneksi tidak berlomba
 // dengan penukaran HTML terakhir. "saran" disisipkan di antara keduanya karena
 // ia baru siap setelah jawaban habis, tapi tetap harus terkirim sebelum
@@ -536,7 +623,8 @@ func (s *Server) handleAlir(w http.ResponseWriter, r *http.Request) {
 	// Rujukan dikirim sebagai event sendiri supaya tidak tercampur ke dalam
 	// teks jawaban. Kalau ikut dialirkan lewat delta, ia akan masuk juga ke
 	// riwayat percakapan dan ikut terbaca model pada giliran berikutnya —
-	// padahal ia bukan bagian dari jawaban.
+	// padahal ia bukan bagian dari jawaban. Adapter memanggilnya setelah
+	// potongan terakhir, sesudah labelnya disaring.
 	kirimSumber := func(sumber []string) error {
 		if len(sumber) == 0 {
 			return nil
@@ -667,16 +755,71 @@ func (s *Server) renderMarkdown(teks string) string {
 
 // renderSumber merender daftar rujukan potongan dokumen.
 //
+// Label yang berasal dari nomor pasal — "Pasal 7" — mendapat nomor yang bisa
+// dipakai tombolnya untuk memuat isi pasal. Label lain dibiarkan tanpa nomor.
+//
 // Sama seperti renderPesan, markup-nya ada di template supaya kelas Tailwind-nya
 // ikut ter-build.
 func (s *Server) renderSumber(sumber []string) string {
+	item := make([]sumberItem, 0, len(sumber))
+	for _, label := range sumber {
+		it := sumberItem{Label: label}
+		if m := reLabelPasal.FindStringSubmatch(label); m != nil {
+			it.Nomor = m[1]
+		}
+		item = append(item, it)
+	}
+
 	var b strings.Builder
 
-	if err := s.tmpl.ExecuteTemplate(&b, "sumber", sumber); err != nil {
+	if err := s.tmpl.ExecuteTemplate(&b, "sumber", item); err != nil {
 		log.Printf("web: merender sumber: %v", err)
 		return ""
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// renderPasal merender isi lengkap satu pasal.
+//
+// Tiap potongan dirender sebagai Markdown lebih dulu — dokumen peraturan
+// datang sebagai Markdown hasil konversi, lengkap dengan daftar bernomor — lalu
+// hasilnya diserahkan ke template. Markup pembungkusnya tetap di template supaya
+// kelas Tailwind-nya ikut ter-build.
+func (s *Server) renderPasal(nomor string, potongan []string) string {
+	bagian := make([]template.HTML, 0, len(potongan))
+	for _, p := range potongan {
+		bagian = append(bagian, template.HTML(s.renderMarkdown(p)))
+	}
+
+	var b strings.Builder
+
+	if err := s.tmpl.ExecuteTemplate(&b, "pasal", dataPasal{Nomor: nomor, Potongan: bagian}); err != nil {
+		log.Printf("web: merender pasal: %v", err)
+		return ""
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// renderPasalKosong merender pesan ketika isi pasal tidak bisa ditampilkan.
+func (s *Server) renderPasalKosong(pesan string) string {
+	var b strings.Builder
+
+	if err := s.tmpl.ExecuteTemplate(&b, "pasal-kosong", dataPasalKosong{Pesan: pesan}); err != nil {
+		log.Printf("web: merender pesan pasal: %v", err)
+		return ""
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// sumberItem adalah satu label rujukan di template.
+//
+// Label yang berasal dari nomor pasal — "Pasal 7" — mendapat Nomor, sehingga
+// template merendernya sebagai tombol yang memuat isi pasal itu. Label lain
+// ("Lampiran", "Pembukaan", "Dokumen") tidak punya nomor dan tetap tampil
+// sebagai label biasa.
+type sumberItem struct {
+	Label string
+	Nomor string
 }
 
 // saranItem adalah satu tombol saran di template.

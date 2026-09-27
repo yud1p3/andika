@@ -1,6 +1,9 @@
 package rag
 
 import (
+	"regexp"
+	"strings"
+
 	"github.com/cloudwego/eino/schema"
 )
 
@@ -31,6 +34,64 @@ func LabelSumber(docs []*schema.Document) []string {
 		hasil = append(hasil, label)
 	}
 	return hasil
+}
+
+// reLabelPasal memisahkan nomor dari label "Pasal N".
+var reLabelPasal = regexp.MustCompile(`^Pasal (\d+)$`)
+
+// SaringSumber menyisakan label rujukan yang penandanya benar-benar muncul di
+// teks jawaban.
+//
+// Kenapa perlu. LabelSumber menyusun daftar dari SELURUH potongan hasil
+// retrieval, bukan hanya yang dipakai menjawab. Di jalur agen selisihnya paling
+// terasa: jejakRetrieval mengumpulkan potongan dari setiap panggilan tool
+// selama satu permintaan (lihat tools.go), jadi agen yang mencari dua kali
+// dengan TOP_K=10 bisa memunculkan sampai 20 label — walaupun jawabannya hanya
+// bersumber dari satu pasal. Terukur pada "Apa saja yang termasuk Naskah Dinas
+// arahan": 19 label rujukan, padahal jawabannya memakai Pasal 8 saja.
+//
+// Aturannya sengaja sederhana: label lolos kalau penandanya disebut di
+// jawaban. "Pasal 8" lolos kalau jawaban menyebut "Pasal 8" — bukan "Pasal 89",
+// batas kata dijaga karena polanya menangkap deret angkanya secara utuh. Label
+// lain — "Lampiran", "Pembukaan", "Dokumen" — dicocokkan sebagai kata biasa.
+// Urutan label dipertahankan.
+//
+// Batasnya disadari: model yang menjawab benar tanpa menyebut pasalnya akan
+// kehilangan rujukan. Karena itu kedua jalur diminta menyebut pasal sumbernya —
+// lihat systemInstruction di chain.go dan agenInstruction di agent.go. Jawaban
+// kosong menghasilkan daftar kosong, bukan seluruh label: tanpa jawaban, tidak
+// ada yang bisa disebut "dipakai menjawab".
+func SaringSumber(label []string, jawaban string) []string {
+	if len(label) == 0 || strings.TrimSpace(jawaban) == "" {
+		return nil
+	}
+
+	teks := strings.ToLower(jawaban)
+	hasil := make([]string, 0, len(label))
+	for _, l := range label {
+		if disebutDiJawaban(l, teks) {
+			hasil = append(hasil, l)
+		}
+	}
+	return hasil
+}
+
+// disebutDiJawaban memutuskan apakah satu label muncul di teks jawaban yang
+// sudah dinormalkan ke huruf kecil.
+//
+// reRujukanPasal dipakai ulang, bukan disusun lagi: ia sudah menjadi pola baku
+// "pasal N" di paket ini, dan karena menangkap deret angkanya utuh, "Pasal 8"
+// tidak akan cocok dengan jawaban yang hanya menyebut "Pasal 89".
+func disebutDiJawaban(label, teks string) bool {
+	if m := reLabelPasal.FindStringSubmatch(label); m != nil {
+		for _, d := range reRujukanPasal.FindAllStringSubmatch(teks, -1) {
+			if d[1] == m[1] {
+				return true
+			}
+		}
+		return false
+	}
+	return strings.Contains(teks, strings.ToLower(label))
 }
 
 // labelSumber menentukan teks penanda sebuah potongan.
