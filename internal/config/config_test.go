@@ -310,3 +310,81 @@ func TestChatAPIKeyDefault(t *testing.T) {
 		t.Errorf("ChatAPIKey = %q, mau %q", cfg.ChatAPIKey, "sk-gemini")
 	}
 }
+
+// TestKodeDefault mengunci default konfigurasi kode klasifikasi.
+//
+// Nilainya penting karena menentukan collection Qdrant mana yang dibaca dan
+// kolom mana yang diambil saat impor; mengubahnya tanpa sadar berarti impor
+// membaca tabel yang salah atau menulis ke collection yang salah.
+func TestKodeDefault(t *testing.T) {
+	for _, k := range []string{
+		"DATABASE_URL", "QDRANT_COLLECTION_KODE", "KODE_TABEL", "KODE_KOLOM_ID",
+		"KODE_KOLOM_KODE", "KODE_KOLOM_URAIAN", "KODE_KOLOM_VEKTOR", "KODE_KOLOM_PATH", "KODE_TOP_K",
+	} {
+		t.Setenv(k, "")
+	}
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+
+	if cfg.DatabaseURL != "" {
+		t.Errorf("DatabaseURL = %q, mau kosong", cfg.DatabaseURL)
+	}
+	if cfg.KodeCollection != "kode_klasifikasi" {
+		t.Errorf("KodeCollection = %q, mau %q", cfg.KodeCollection, "kode_klasifikasi")
+	}
+	if cfg.KodeTabel != "kode_klasifikasi" {
+		t.Errorf("KodeTabel = %q, mau %q", cfg.KodeTabel, "kode_klasifikasi")
+	}
+	if cfg.KodeKolomID != "id" {
+		t.Errorf("KodeKolomID = %q, mau %q", cfg.KodeKolomID, "id")
+	}
+	if cfg.KodeKolomKode != "kode" {
+		t.Errorf("KodeKolomKode = %q, mau %q", cfg.KodeKolomKode, "kode")
+	}
+	if cfg.KodeKolomUraian != "uraian" {
+		t.Errorf("KodeKolomUraian = %q, mau %q", cfg.KodeKolomUraian, "uraian")
+	}
+	if cfg.KodeKolomVektor != "embedding" {
+		t.Errorf("KodeKolomVektor = %q, mau %q", cfg.KodeKolomVektor, "embedding")
+	}
+	if cfg.KodeKolomPath != "path" {
+		t.Errorf("KodeKolomPath = %q, mau %q", cfg.KodeKolomPath, "path")
+	}
+	if cfg.KodeTopK != 10 {
+		t.Errorf("KodeTopK = %d, mau 10", cfg.KodeTopK)
+	}
+}
+
+// TestKodeIdentifierTidakSahDilaporkan memastikan nama tabel/kolom yang aneh
+// ditolak di depan.
+//
+// Nilainya disisipkan ke SQL, jadi nilai seperti "kode; DROP TABLE" atau nama
+// bertitik harus dilaporkan sebagai konfigurasi tidak sah, bukan diteruskan.
+func TestKodeIdentifierTidakSahDilaporkan(t *testing.T) {
+	for _, nilai := range []string{"kode; DROP TABLE x", "skema.tabel", "nama tabel", `"kode"`} {
+		t.Run("KODE_TABEL="+nilai, func(t *testing.T) {
+			t.Setenv("KODE_TABEL", nilai)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() berhasil dengan KODE_TABEL=%q, mau error", nilai)
+			}
+		})
+	}
+}
+
+// TestKodeTopKTidakMasukAkalDilaporkan menjaga jumlah kandidat tetap bermakna.
+// Nol berarti model tidak pernah menerima bahan apa pun.
+func TestKodeTopKTidakMasukAkalDilaporkan(t *testing.T) {
+	for _, nilai := range []string{"0", "-3"} {
+		t.Run("KODE_TOP_K="+nilai, func(t *testing.T) {
+			t.Setenv("KODE_TOP_K", nilai)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() berhasil dengan KODE_TOP_K=%s, mau error", nilai)
+			}
+		})
+	}
+}

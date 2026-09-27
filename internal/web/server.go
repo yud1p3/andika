@@ -140,6 +140,18 @@ type Alirkan func(
 // tentang Qdrant maupun cara potongan disimpan.
 type BacaPasal func(ctx context.Context, nomor string) ([]string, error)
 
+// RekomendasiKode mengalirkan rekomendasi kode klasifikasi untuk satu perihal
+// naskah, dipicu ketika pengguna mengetik KK#perihal#.
+//
+// delta menerima potongan teks jawaban, sama seperti Alirkan. Tidak ada event
+// rujukan maupun saran pada jalur ini: permintaan klasifikasi berdiri sendiri,
+// dan hasilnya bukan kutipan pasal.
+//
+// Nil berarti fitur dimatikan: KK#perihal# diperlakukan sebagai pertanyaan
+// biasa. Ini yang membuat penambahan jalur tidak mengubah perilaku pemanggil
+// lama (mis. test) yang tidak mengisinya.
+type RekomendasiKode func(ctx context.Context, perihal string, delta func(string) error) error
+
 // Pola nomor pasal. Dipakai di dua tempat: memvalidasi nomor dari query string,
 // dan mengenali label rujukan "Pasal 7" yang boleh diklik.
 var (
@@ -150,6 +162,14 @@ var (
 	// Label lain — "Lampiran", "Pembukaan", "Dokumen" — tidak punya nomor
 	// yang bisa diambil, jadi tetap ditampilkan sebagai label biasa.
 	reLabelPasal = regexp.MustCompile(`^Pasal (\d+)$`)
+
+	// reKodeKlasifikasi cocok dengan permintaan rekomendasi kode klasifikasi:
+	// "KK#perihal naskah#". Awalan "KK" tidak peka huruf besar-kecil, dan teks
+	// di antara kedua '#' adalah perihal yang di-embed.
+	//
+	// Isi perihalnya minimal satu karakter: "KK##" tidak dianggap permintaan
+	// klasifikasi, melainkan jatuh ke jalur pertanyaan biasa.
+	reKodeKlasifikasi = regexp.MustCompile(`(?is)^\s*KK#\s*(.+?)\s*#\s*$`)
 )
 
 // Tampilan adalah keterangan yang dipajang di kepala halaman.
@@ -270,12 +290,13 @@ func (s *sesi) kosongkan() {
 
 // Server menyajikan halaman tanya-jawab.
 type Server struct {
-	alirkan   Alirkan
-	bacaPasal BacaPasal
-	tampilan  Tampilan
-	tmpl      *template.Template
-	md        goldmark.Markdown
-	statik    http.Handler
+	alirkan     Alirkan
+	bacaPasal   BacaPasal
+	rekomendasi RekomendasiKode
+	tampilan    Tampilan
+	tmpl        *template.Template
+	md          goldmark.Markdown
+	statik      http.Handler
 
 	// waktuTungguSaran membatasi berapa lama handleAlir menunggu saran
 	// setelah jawaban selesai. Lihat tungguSaranDefault.
@@ -286,11 +307,11 @@ type Server struct {
 	sesi map[string]*sesi
 }
 
-// New menyiapkan server dari fungsi penjawab, pembaca pasal, dan keterangan
-// tampilan.
+// New menyiapkan server dari fungsi penjawab, pembaca pasal, keterangan
+// tampilan, dan penyusun rekomendasi kode klasifikasi.
 //
-// bacaPasal boleh nil; lihat catatan pada BacaPasal.
-func New(alirkan Alirkan, bacaPasal BacaPasal, tampilan Tampilan) (*Server, error) {
+// bacaPasal dan rekomendasi boleh nil; lihat catatan pada masing-masing tipe.
+func New(alirkan Alirkan, bacaPasal BacaPasal, tampilan Tampilan, rekomendasi RekomendasiKode) (*Server, error) {
 	tmpl, err := template.ParseFS(aset, "templates/*.html")
 	if err != nil {
 		return nil, fmt.Errorf("membaca template: %w", err)
@@ -312,6 +333,7 @@ func New(alirkan Alirkan, bacaPasal BacaPasal, tampilan Tampilan) (*Server, erro
 		waktuTungguSaran: tungguSaranDefault,
 		sesi:             make(map[string]*sesi),
 		bacaPasal:        bacaPasal,
+		rekomendasi:      rekomendasi,
 	}, nil
 }
 
@@ -613,6 +635,14 @@ func (s *Server) handleAlir(w http.ResponseWriter, r *http.Request) {
 		defer ss.selesai()
 	}
 
+	// Permintaan klasifikasi kode (KK#perihal#) ditangani jalur sendiri:
+	// tanpa riwayat percakapan, tanpa rujukan pasal, dan tanpa saran lanjutan.
+	// Gilirannya juga tidak dicatat ke riwayat sesi — lihat alirKode.
+	if perihal, ok := perihalKodeKlasifikasi(pertanyaan); ok && s.rekomendasi != nil {
+		s.alirKode(r.Context(), perihal, kirim)
+		return
+	}
+
 	var riwayat []Pesan
 	var generasi uint64
 	if ss != nil {
@@ -698,6 +728,65 @@ func (s *Server) handleAlir(w http.ResponseWriter, r *http.Request) {
 	}
 
 	_ = kirim("tutup", "")
+}
+
+// alirKode menjalankan jalur rekomendasi kode klasifikasi dan mengirim
+// hasilnya sebagai Server-Sent Events.
+//
+// Urutan event-nya lebih pendek dari jalur perbup: hanya "delta", "selesai",
+// lalu "tutup". Tidak ada "sumber" (hasilnya bukan kutipan pasal) maupun
+// "saran" (klasifikasi berdiri sendiri, tidak ada lanjutan yang masuk akal).
+//
+// Giliran ini sengaja tidak dicatat ke riwayat sesi: permintaan klasifikasi
+// tidak berhubungan dengan isi dokumen peraturan, dan mencampurnya akan membuat
+// pertanyaan perbup berikutnya melihat konteks yang tidak relevan.
+func (s *Server) alirKode(ctx context.Context, perihal string, kirim func(nama, isi string) error) {
+	var utuh strings.Builder
+
+	err := s.rekomendasi(ctx, perihal, func(potongan string) error {
+		utuh.WriteString(potongan)
+		// Sama seperti jalur perbup: potongan di-escape karena htmx menukar
+		// isi event sebagai HTML.
+		return kirim("delta", html.EscapeString(potongan))
+	})
+
+	if err != nil {
+		if ctx.Err() != nil {
+			// Klien memutus koneksi; tidak ada lagi yang bisa dikirimi.
+			return
+		}
+		log.Printf("web: rekomendasi kode gagal: %v", err)
+	}
+
+	final := s.renderMarkdown(utuh.String())
+	if err != nil {
+		final += s.renderPesan("pesan-galat", fmt.Sprintf("Terhenti: %v", err))
+	}
+
+	if e := kirim("selesai", final); e != nil {
+		return
+	}
+
+	_ = kirim("tutup", "")
+}
+
+// perihalKodeKlasifikasi mengenali permintaan rekomendasi kode klasifikasi dan
+// mengembalikan perihalnya.
+//
+// Bentuk yang diterima: "KK#perihal naskah#". Nilai kedua bernilai false kalau
+// teksnya bukan permintaan klasifikasi, atau perihalnya kosong — dalam hal itu
+// pemanggil memperlakukannya sebagai pertanyaan biasa.
+func perihalKodeKlasifikasi(teks string) (string, bool) {
+	m := reKodeKlasifikasi.FindStringSubmatch(teks)
+	if m == nil {
+		return "", false
+	}
+
+	perihal := strings.TrimSpace(m[1])
+	if perihal == "" {
+		return "", false
+	}
+	return perihal, true
 }
 
 // tolakSibuk membalas permintaan yang datang saat sesi yang sama masih

@@ -1185,6 +1185,97 @@ normal (tidak menyentuh chat model); yang gagal hanya `rag ask` dan `rag serve`.
 
 ---
 
+## Rekomendasi kode klasifikasi (web)
+
+Fitur ini menjawab pertanyaan yang berbeda dari sisa proyek. Alih-alih mencari isi
+dokumen peraturan, ia mencari **kode klasifikasi** yang paling cocok untuk sebuah
+perihal naskah — misalnya "permohonan cuti tahunan".
+
+Cara pakainya di client web: ketik perihal dengan format
+
+```
+KK#perihal naskah#
+```
+
+misalnya `KK#permohonan cuti tahunan#`. Awalan `KK#` dan penutup `#` wajib. Teks di
+antaranya di-embed, dicocokkan dengan kode yang tersimpan di Qdrant, lalu sejumlah
+kandidat terdekat (`KODE_TOP_K`, default 10) diserahkan ke model untuk memilih yang
+paling sesuai — jawabannya berupa kode terbaik, alasan singkat, dan beberapa
+alternatif.
+
+### Menyalin kode dari PostgreSQL
+
+Kode klasifikasi dan vektornya sudah ada di PostgreSQL. Perintah berikut menyalinnya
+ke collection Qdrant tersendiri:
+
+```bash
+rag impor-kode
+```
+
+Vektornya disalin **apa adanya** — tidak ada embed ulang, jadi tidak memakai kuota.
+Syaratnya vektor di PostgreSQL dibuat dengan model, dimensi, dan TaskType yang sama
+dengan proyek ini:
+
+| Aspek | Nilai yang harus sama |
+|---|---|
+| Model | `gemini-embedding-2` (lihat `GEMINI_EMBED_MODEL`) |
+| Dimensi | 768 (lihat `GEMINI_EMBED_DIM`) |
+| TaskType | `RETRIEVAL_DOCUMENT` |
+
+Dimensi yang berbeda ditolak saat impor dengan pesan yang menyebut kodenya. Model
+atau TaskType yang berbeda **tidak** bisa dideteksi otomatis: vektornya tetap masuk,
+pencariannya tetap berjalan, tetapi skor kemiripannya tidak bermakna — dan itu lebih
+berbahaya daripada error karena tampak berhasil. Kalau asal vektornya diragukan,
+buat ulang vektornya di PostgreSQL dengan model di atas sebelum impor.
+
+Pada data yang dipakai proyek ini (`klasifikasi_embedding`), vektor ternyata dibuat
+dari kolom **`path`** — hierarki lengkap seperti
+`KEPEGAWAIAN > ADMINISTRASI PEGAWAI > Cuti Sakit, Cuti Bersalin, Cuti Tahunan` —
+bukan dari `deskripsi` saja. Ini diverifikasi dengan membandingkan vektor tersimpan
+terhadap hasil embed ulang: cosine dengan `embed(path)` = 1.0000, sedangkan dengan
+`embed(deskripsi)` hanya 0.8973. Karena itu `path` ikut disimpan di payload dan
+ditampilkan ke model, sebab di situlah konteks hierarkinya berada.
+
+Dua sifat data yang membentuk desain impor:
+
+- **`kode` tidak unik.** Satu kode bisa dipakai beberapa item — pada data ini ada 12
+  kode seperti itu (mis. `027.04.02.01` dipakai "Penyelenggaraan Diklat" dan "Sistem
+  informasi"). Karena itu ID titik Qdrant diambil dari kolom kunci unik (`id`), bukan
+  dari kode; memakai kode akan membuat baris-baris itu saling menimpa.
+- **Hasil digabung per kode.** Saat mencari, baris berkode sama digabung dan yang
+  dipertahankan adalah yang berskor terbaik, supaya satu kode tidak memakan beberapa
+  slot kandidat dan kode lain yang relevan tetap ikut tampil.
+
+Impor bersifat idempoten: ID titik diturunkan dari kode, jadi menjalankannya ulang
+menimpa titik yang sama, bukan menggandakannya. `rag impor-kode` tidak menyentuh
+collection perbup.
+
+### Kenapa collection terpisah
+
+Kode klasifikasi disimpan di collection sendiri (`QDRANT_COLLECTION_KODE`, default
+`kode_klasifikasi`), bukan digabung dengan isi peraturan. Isinya berbeda jenis — satu
+kode satu titik, bukan potongan pasal — sehingga menggabungkannya akan mencemari
+pencarian perbup: pertanyaan tentang pasal bisa menarik kode klasifikasi, dan
+sebaliknya.
+
+### Konfigurasi
+
+Lihat `.env.example`, blok "Kode klasifikasi (opsional)". `DATABASE_URL` hanya dibaca
+oleh `rag impor-kode`; `rag ask` dan `rag serve` tidak menyentuh PostgreSQL sama
+sekali karena datanya sudah ada di Qdrant.
+
+### Batasan
+
+- Fitur ini hanya ada di client web (`rag serve`), bukan di `rag ask` maupun
+  `rag cari`.
+- Permintaan `KK#…#` tidak masuk ke riwayat percakapan: ia tidak berhubungan dengan
+  isi peraturan, jadi mencampurnya akan mengacaukan konteks pertanyaan perbup
+  berikutnya.
+- Kalau data kode belum diimpor, web membalas pesan yang menyuruh menjalankan
+  `rag impor-kode`, bukan error di tengah halaman.
+
+---
+
 ## Padanan notebook → Go
 
 | Sel notebook | Padanan di proyek ini |
@@ -1433,7 +1524,7 @@ membangun ulang tanpa konversi akan memperburuk hasil.
 ```
 rag-eino/
 ├── cmd/rag/
-│   ├── main.go                  entrypoint CLI + lima subcommand
+│   ├── main.go                  entrypoint CLI + enam subcommand
 │   └── markdown.go              penataan Markdown → ANSI untuk terminal
 ├── internal/
 │   ├── config/config.go         baca .env dan environment variable
@@ -1442,6 +1533,7 @@ rag-eino/
 │   │   └── retry.go             pengulangan otomatis saat kuota tercapai
 │   ├── ingest/
 │   │   ├── ingest.go            jalur tulis: siapkan → baca → potong → embed → simpan
+│   │   ├── kode.go              salin kode klasifikasi dari PostgreSQL (vektor apa adanya)
 │   │   └── pasal.go             splitter sadar-struktur (batas Pasal/BAB/Lampiran)
 │   ├── rag/
 │   │   ├── chain.go             jalur cepat: condense + retriever + prompt + graph
@@ -1451,6 +1543,7 @@ rag-eino/
 │   │   ├── retriever.go         tambahan: ambil langsung pasal yang disebut,
 │   │   │                        lalu ikuti rujukan silangnya satu lompatan
 │   │   ├── cari.go              retrieval saja, untuk memeriksa hasil pencarian
+│   │   ├── klasifikasi.go       rekomendasi kode klasifikasi (web: KK#perihal#)
 │   │   ├── saran.go             saran pertanyaan lanjutan (web saja)
 │   │   ├── sumber.go            label rujukan potongan ("Pasal 7", "Lampiran")
 │   │   ├── pembaca_pasal.go     isi lengkap satu pasal (tombol rujukan web)
@@ -1478,6 +1571,12 @@ Semua pengaturan dibaca dari `.env`. Daftar lengkapnya ada di `.env.example`.
 | `CHAT_API_KEY` | `sk-gemini` | kunci endpoint OpenAI-compatible; hanya dipakai `CHAT_PROVIDER=openai` |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6334` | port gRPC |
 | `QDRANT_COLLECTION` | `pearson_ai` | nama collection |
+| `DATABASE_URL` | — (kosong) | string koneksi PostgreSQL; hanya dibaca `rag impor-kode` |
+| `QDRANT_COLLECTION_KODE` | `kode_klasifikasi` | collection khusus kode klasifikasi |
+| `KODE_TABEL` | `kode_klasifikasi` | tabel sumber kode di PostgreSQL (`.env.example` memakai `klasifikasi_embedding`) |
+| `KODE_KOLOM_ID` | `id` | kolom kunci unik; dipakai sebagai ID titik Qdrant |
+| `KODE_KOLOM_KODE` / `KODE_KOLOM_URAIAN` / `KODE_KOLOM_VEKTOR` / `KODE_KOLOM_PATH` | `kode` / `uraian` / `embedding` / `path` | kolom sumber; harus identifier sederhana |
+| `KODE_TOP_K` | `10` | jumlah kandidat kode yang diserahkan ke model |
 | `DOC_PATH` | `data/ai_pv.pdf` | berkas dokumen sumber; `.pdf` di-parse sebagai PDF, selebihnya dibaca sebagai teks |
 | `DOC_URL` | — (kosong) | opsional; diunduh hanya kalau `DOC_PATH` belum ada |
 | `APP_TITLE` | `Tanya Dokumen` | judul halaman web |

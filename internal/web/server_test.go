@@ -35,7 +35,7 @@ func newTestServer(t *testing.T, alirkan Alirkan) *Server {
 		Model:      "gemini-uji",
 		Collection: "koleksi-uji",
 		TopK:       3,
-	})
+	}, nil)
 	if err != nil {
 		t.Fatalf("membuat server: %v", err)
 	}
@@ -864,7 +864,7 @@ func TestPasalNomorTidakSahDitolak(t *testing.T) {
 func TestPasalTidakDitemukanMembalasMarkup(t *testing.T) {
 	kosong := func(context.Context, string) ([]string, error) { return nil, nil }
 
-	srv, err := New(alirkanTetap("x"), kosong, Tampilan{Title: "uji"})
+	srv, err := New(alirkanTetap("x"), kosong, Tampilan{Title: "uji"}, nil)
 	if err != nil {
 		t.Fatalf("membuat server: %v", err)
 	}
@@ -884,7 +884,7 @@ func TestPasalTidakDitemukanMembalasMarkup(t *testing.T) {
 func TestPasalGagalDibacaMembalasMarkup(t *testing.T) {
 	gagal := func(context.Context, string) ([]string, error) { return nil, errors.New("qdrant mati") }
 
-	srv, err := New(alirkanTetap("x"), gagal, Tampilan{Title: "uji"})
+	srv, err := New(alirkanTetap("x"), gagal, Tampilan{Title: "uji"}, nil)
 	if err != nil {
 		t.Fatalf("membuat server: %v", err)
 	}
@@ -1429,5 +1429,112 @@ func TestResetSaatMengalirTidakMenghidupkanRiwayat(t *testing.T) {
 	}
 	if len(tercatat[1]) != 0 {
 		t.Errorf("riwayat hidup lagi setelah reset di tengah aliran: %v", tercatat[1])
+	}
+}
+
+// newTestServerKode merakit server dengan jalur rekomendasi kode terpasang.
+//
+// rekomendasi boleh nil; itu mewakili server yang tidak mengaktifkan fitur.
+func newTestServerKode(t *testing.T, alirkan Alirkan, rekomendasi RekomendasiKode) *Server {
+	t.Helper()
+
+	srv, err := New(alirkan, bacaPasalTetap, Tampilan{Title: "uji"}, rekomendasi)
+	if err != nil {
+		t.Fatalf("membuat server: %v", err)
+	}
+	return srv
+}
+
+// TestKodeKlasifikasiMemakaiJalurRekomendasi mengunci bahwa KK#perihal# tidak
+// masuk ke jalur tanya-jawab biasa, melainkan ke jalur rekomendasi kode.
+//
+// '#' di query string harus di-encode menjadi %23: kalau tidak, peramban
+// menganggapnya awal fragmen URL dan perihalnya tidak pernah sampai ke server.
+func TestKodeKlasifikasiMemakaiJalurRekomendasi(t *testing.T) {
+	var (
+		perihalDiterima  string
+		alirkanDipanggil bool
+	)
+
+	alirkan := func(context.Context, string, []Pesan, func(string) error, func([]string) error) (SaluranSaran, error) {
+		alirkanDipanggil = true
+		return nil, nil
+	}
+	rekomendasi := func(_ context.Context, perihal string, delta func(string) error) error {
+		perihalDiterima = perihal
+		return delta("Kode terbaik: 090.1 — Cuti tahunan")
+	}
+
+	srv := newTestServerKode(t, alirkan, rekomendasi)
+
+	rec := panggil(t, srv, "/tanya/alir?q=KK%23permohonan+cuti+tahunan%23")
+	isi := rec.Body.String()
+
+	if alirkanDipanggil {
+		t.Error("jalur tanya-jawab biasa ikut dipanggil untuk permintaan KK#")
+	}
+	if perihalDiterima != "permohonan cuti tahunan" {
+		t.Errorf("perihal diterima = %q, mau %q", perihalDiterima, "permohonan cuti tahunan")
+	}
+	if !strings.Contains(isi, "data: Kode terbaik: 090.1 — Cuti tahunan") {
+		t.Errorf("tidak ada delta rekomendasi:\n%s", isi)
+	}
+	if !strings.Contains(isi, "event: selesai") || !strings.Contains(isi, "event: tutup") {
+		t.Errorf("penutup aliran tidak lengkap:\n%s", isi)
+	}
+	if strings.Contains(isi, "event: sumber") || strings.Contains(isi, "event: saran") {
+		t.Errorf("jalur kode tidak boleh mengirim sumber maupun saran:\n%s", isi)
+	}
+}
+
+// TestKodeKlasifikasiTidakMasukRiwayat memastikan permintaan klasifikasi tidak
+// meninggalkan jejak di riwayat sesi.
+//
+// Kalau tercatat, pertanyaan perbup berikutnya akan melihat konteks yang tidak
+// relevan, dan jawabannya bisa melenceng tanpa sebab yang terlihat.
+func TestKodeKlasifikasiTidakMasukRiwayat(t *testing.T) {
+	var tercatat [][]Pesan
+
+	alirkan := func(_ context.Context, _ string, riwayat []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
+		tercatat = append(tercatat, riwayat)
+		return nil, delta("dijawab")
+	}
+	rekomendasi := func(_ context.Context, _ string, delta func(string) error) error {
+		return delta("rekomendasi kode")
+	}
+
+	srv := newTestServerKode(t, alirkan, rekomendasi)
+	cookie := cookieSesiMuat(t, srv)
+
+	// Permintaan klasifikasi lebih dulu; ia tidak boleh meninggalkan jejak.
+	panggilDenganCookie(t, srv, "/tanya/alir?q=KK%23perihal+pertama%23", cookie)
+
+	// Pertanyaan biasa sesudahnya harus melihat riwayat kosong.
+	panggilDenganCookie(t, srv, "/tanya/alir?q=pertanyaan+biasa", cookie)
+
+	if len(tercatat) != 1 {
+		t.Fatalf("jalur tanya-jawab biasa dipanggil %d kali, mau 1", len(tercatat))
+	}
+	if len(tercatat[0]) != 0 {
+		t.Errorf("riwayat pertanyaan biasa = %v, mau kosong (KK# tidak boleh tercatat)", tercatat[0])
+	}
+}
+
+// TestKodeKlasifikasiTanpaSeamJadiPertanyaanBiasa memastikan perilaku lama
+// tidak berubah ketika fitur tidak dipasang: server dengan rekomendasi nil
+// memperlakukan KK#perihal# sebagai pertanyaan biasa.
+func TestKodeKlasifikasiTanpaSeamJadiPertanyaanBiasa(t *testing.T) {
+	dipanggil := false
+
+	alirkan := func(_ context.Context, _ string, _ []Pesan, delta func(string) error, _ func([]string) error) (SaluranSaran, error) {
+		dipanggil = true
+		return nil, delta("dijawab sebagai pertanyaan biasa")
+	}
+
+	srv := newTestServerKode(t, alirkan, nil)
+	panggil(t, srv, "/tanya/alir?q=KK%23perihal%23")
+
+	if !dipanggil {
+		t.Error("jalur tanya-jawab biasa tidak dipanggil padahal rekomendasi nil")
 	}
 }

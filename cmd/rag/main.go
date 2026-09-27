@@ -39,6 +39,8 @@ const usage = `rag — RAG (Retrieval-Augmented Generation) dengan Gemini, Eino,
 Pemakaian:
   rag ingest       Unduh dokumen, potong jadi chunk, embed, lalu simpan ke Qdrant
                    (jalankan sekali saja sebelum perintah "ask")
+  rag impor-kode   Salin kode klasifikasi beserta vektornya dari PostgreSQL ke Qdrant
+                   (butuh DATABASE_URL di .env; lihat "rag impor-kode" di bawah)
   rag ask          Tanya-jawab interaktif berdasarkan dokumen yang tersimpan
   rag cari         Tampilkan potongan yang diambil retriever untuk sebuah pertanyaan
                    (tanpa memanggil model; untuk memeriksa hasil pencarian)
@@ -51,6 +53,12 @@ Opsi "rag cari":
 
 Opsi "rag serve":
   -addr string     Alamat dan port yang didengarkan (default "127.0.0.1:8080")
+
+Kode klasifikasi:
+  Di client web, ketik KK#perihal naskah# (mis. "KK#permohonan cuti tahunan#")
+  untuk meminta rekomendasi kode klasifikasi. Perihalnya di-embed, dicocokkan
+  dengan kode yang sudah diimpor, lalu model memilih yang paling sesuai.
+  Fitur ini butuh "rag impor-kode" dijalankan lebih dulu.
 
 Perintah di dalam "rag ask":
   reset            Kosongkan riwayat percakapan, mulai lagi dari konteks kosong
@@ -91,6 +99,8 @@ func main() {
 	switch os.Args[1] {
 	case "ingest":
 		err = runIngest(ctx, cfg)
+	case "impor-kode":
+		err = runImporKode(ctx, cfg)
 	case "ask":
 		err = runAsk(ctx, cfg)
 	case "cari":
@@ -121,6 +131,22 @@ func runIngest(ctx context.Context, cfg *config.Config) error {
 	defer qc.Close()
 
 	return ingest.Run(ctx, cfg, ai, qc)
+}
+
+// runImporKode menyalin kode klasifikasi beserta vektornya dari PostgreSQL ke
+// Qdrant.
+//
+// Tidak membuat client Gemini: vektornya sudah jadi di PostgreSQL dan disalin
+// apa adanya, jadi tidak ada embedding yang perlu dipanggil dan perintah ini
+// tidak memakai kuota.
+func runImporKode(ctx context.Context, cfg *config.Config) error {
+	qc, err := newQdrantClient(cfg)
+	if err != nil {
+		return err
+	}
+	defer qc.Close()
+
+	return ingest.ImporKode(ctx, cfg, qc)
 }
 
 // runAsk menjalankan jalur baca: tanya-jawab interaktif di terminal.
@@ -431,6 +457,13 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 	// embedding — lihat rag.PembacaPasal.
 	pembaca := rag.NewPembacaPasal(qc, cfg.QdrantCollection)
 
+	// Jalur rekomendasi kode klasifikasi (KK#perihal#), hanya dipasang di web.
+	// Pencariannya memakai collection terpisah, jadi tidak mengganggu retrieval
+	// perbup. Kalau datanya belum diimpor, jalur ini membalas pesan yang
+	// menyuruh menjalankan "rag impor-kode" — bukan error di tengah halaman.
+	pencariKode := rag.NewPencariKode(qc, cfg.KodeCollection, ai.QueryEmbedder)
+	penjawabKode := rag.NewPenjawabKode(pencariKode, ai.ChatModel, cfg.KodeTopK)
+
 	srv, err := web.New(
 		alirkanDariPenjawab(penjawab, ai.ChatModel, cfg.HistoryMessages, cfg.SaranCount, batas),
 		bacaPasalDari(pembaca),
@@ -440,12 +473,42 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 			Model:      cfg.ChatModel,
 			Collection: cfg.QdrantCollection,
 			TopK:       cfg.TopK,
-		})
+		},
+		rekomendasiKodeDari(penjawabKode),
+	)
 	if err != nil {
 		return err
 	}
 
 	return srv.Serve(ctx, *addr)
+}
+
+// rekomendasiKodeDari menyambungkan rag.PenjawabKode ke tipe web.RekomendasiKode.
+//
+// Paket web tidak mengenal rag.PenjawabKode; ia hanya butuh aliran teksnya.
+// Sama seperti bacaPasalDari dan alirkanDariPenjawab, fungsi ini tempat kedua
+// tipe bertemu.
+func rekomendasiKodeDari(p *rag.PenjawabKode) web.RekomendasiKode {
+	return func(ctx context.Context, perihal string, delta func(string) error) error {
+		sr, err := p.Rekomendasi(ctx, perihal)
+		if err != nil {
+			return err
+		}
+		defer sr.Close()
+
+		for {
+			potongan, err := sr.Recv()
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if err := delta(potongan); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // bacaPasalDari menyambungkan rag.PembacaPasal ke tipe web.BacaPasal.

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -69,6 +70,47 @@ type Config struct {
 	// lewat gRPC. Port 6333 adalah REST API dan hanya dipakai untuk cek manual.
 	QdrantPort       int
 	QdrantCollection string
+
+	// --- Kode klasifikasi ---
+
+	// DatabaseURL adalah string koneksi PostgreSQL tempat kode klasifikasi
+	// beserta vektornya disimpan. Dipakai hanya oleh perintah "rag impor-kode";
+	// jalur baca (rag serve) tidak menyentuh PostgreSQL sama sekali karena
+	// datanya sudah disalin ke Qdrant.
+	//
+	// Dibiarkan kosong di Load supaya "ask" dan "serve" tetap bisa jalan tanpa
+	// database. Perintah impor yang akan melaporkan sendiri kalau nilainya
+	// kosong.
+	DatabaseURL string
+	// KodeCollection adalah collection Qdrant khusus kode klasifikasi.
+	//
+	// Sengaja dipisah dari QdrantCollection (isi dokumen peraturan): isinya
+	// berbeda jenis — satu kode satu titik, bukan potongan pasal — sehingga
+	// menggabungkannya hanya akan mencemari pencarian perbup.
+	KodeCollection string
+	// KodeTabel dan KodeKolom* menentukan dari mana data dibaca di PostgreSQL.
+	//
+	// Dibuat konfigurabel karena nama tabel/kolom bergantung pada skema yang
+	// sudah ada di luar proyek ini. Nilainya disisipkan ke SQL, jadi tiap nama
+	// divalidasi sebagai identifier sederhana (lihat cekIdentifier) — bukan
+	// kutipan bebas yang bisa menyelundupkan perintah lain.
+	//
+	// KodeKolomID adalah kunci unik baris. Ia dipakai sebagai ID titik Qdrant
+	// karena kolom kode TIDAK unik: satu kode bisa dipakai beberapa item
+	// (mis. dua sub-bidang yang berkode sama). Memakai kode sebagai ID akan
+	// membuat baris-baris itu saling menimpa.
+	KodeTabel       string
+	KodeKolomID     string
+	KodeKolomKode   string
+	KodeKolomUraian string
+	KodeKolomVektor string
+	// KodeKolomPath adalah kolom hierarki lengkap ("A > B > C"). Inilah teks
+	// yang di-embed saat vektor kode dibuat, jadi ia juga yang paling berguna
+	// disertakan ke model saat memilih kode.
+	KodeKolomPath string
+	// KodeTopK adalah jumlah kandidat kode yang diambil dari Qdrant untuk
+	// diserahkan ke model saat pengguna mengetik KK#perihal#.
+	KodeTopK int
 
 	// --- Sumber dokumen ---
 
@@ -188,12 +230,21 @@ func Load() (*Config, error) {
 		AppTitle:         envStr("APP_TITLE", "Tanya Dokumen"),
 		AppSubtitle:      envStr("APP_SUBTITLE", "RAG dengan Eino, Gemini, dan Qdrant"),
 
-		EmbedDim:      envInt32("GEMINI_EMBED_DIM", 768, &errs),
-		QdrantPort:    envInt("QDRANT_PORT", 6334, &errs),
-		ChunkStrategy: envStr("CHUNK_STRATEGY", "pasal"),
-		ChunkSize:     envInt("CHUNK_SIZE", 500, &errs),
-		ChunkOverlap:  envInt("CHUNK_OVERLAP", 100, &errs),
-		TopK:          envInt("TOP_K", 10, &errs),
+		EmbedDim:        envInt32("GEMINI_EMBED_DIM", 768, &errs),
+		QdrantPort:      envInt("QDRANT_PORT", 6334, &errs),
+		DatabaseURL:     os.Getenv("DATABASE_URL"),
+		KodeCollection:  envStr("QDRANT_COLLECTION_KODE", "kode_klasifikasi"),
+		KodeTabel:       envStr("KODE_TABEL", "kode_klasifikasi"),
+		KodeKolomID:     envStr("KODE_KOLOM_ID", "id"),
+		KodeKolomKode:   envStr("KODE_KOLOM_KODE", "kode"),
+		KodeKolomUraian: envStr("KODE_KOLOM_URAIAN", "uraian"),
+		KodeKolomVektor: envStr("KODE_KOLOM_VEKTOR", "embedding"),
+		KodeKolomPath:   envStr("KODE_KOLOM_PATH", "path"),
+		KodeTopK:        envInt("KODE_TOP_K", 10, &errs),
+		ChunkStrategy:   envStr("CHUNK_STRATEGY", "pasal"),
+		ChunkSize:       envInt("CHUNK_SIZE", 500, &errs),
+		ChunkOverlap:    envInt("CHUNK_OVERLAP", 100, &errs),
+		TopK:            envInt("TOP_K", 10, &errs),
 		// 6 pesan = 3 giliran tanya-jawab terakhir. Cukup untuk merujuk
 		// "poin a di atas" tanpa membengkakkan prompt.
 		HistoryMessages: envInt("HISTORY_MESSAGES", 6, &errs),
@@ -272,6 +323,33 @@ func Load() (*Config, error) {
 			"AGENT_TIMEOUT_SECONDS=%d tidak masuk akal; harus minimal 1", cfg.AgentTimeoutSeconds))
 	}
 
+	// Nama tabel dan kolom kode klasifikasi disisipkan langsung ke SQL, jadi
+	// tiap nama harus identifier sederhana. Nilai aneh dilaporkan, bukan
+	// dibiarkan lewat: selain berisiko, salah ketik di sini baru terasa sebagai
+	// error SQL yang membingungkan saat impor.
+	for _, id := range []struct{ nama, nilai string }{
+		{"KODE_TABEL", cfg.KodeTabel},
+		{"KODE_KOLOM_ID", cfg.KodeKolomID},
+		{"KODE_KOLOM_KODE", cfg.KodeKolomKode},
+		{"KODE_KOLOM_URAIAN", cfg.KodeKolomUraian},
+		{"KODE_KOLOM_VEKTOR", cfg.KodeKolomVektor},
+		{"KODE_KOLOM_PATH", cfg.KodeKolomPath},
+	} {
+		if !cekIdentifier(id.nilai) {
+			errs = append(errs, fmt.Errorf(
+				"%s=%q bukan nama tabel/kolom yang sah; pakai huruf, angka, dan garis bawah, "+
+					"tanpa spasi atau tanda kutip", id.nama, id.nilai))
+		}
+	}
+
+	// Jumlah kandidat kode nol atau negatif membuat model tidak pernah menerima
+	// bahan apa pun. Lebih baik dilaporkan daripada menghasilkan rekomendasi
+	// kosong tanpa penjelasan.
+	if cfg.KodeTopK < 1 {
+		errs = append(errs, fmt.Errorf(
+			"KODE_TOP_K=%d tidak masuk akal; harus minimal 1", cfg.KodeTopK))
+	}
+
 	if len(errs) > 0 {
 		return nil, errors.Join(errs...)
 	}
@@ -325,6 +403,20 @@ func resolvePath(root, path string) string {
 		return path
 	}
 	return filepath.Join(root, path)
+}
+
+// reIdentifier cocok dengan nama tabel/kolom SQL yang sederhana: diawali huruf
+// atau garis bawah, dilanjutkan huruf, angka, atau garis bawah.
+var reIdentifier = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// cekIdentifier memastikan sebuah nama aman disisipkan ke SQL tanpa kutip.
+//
+// Nama tabel dan kolom kode klasifikasi dirakit ke query lewat Sprintf, jadi
+// nilai dari .env tidak boleh memuat spasi, tanda kutip, titik, atau titik dua
+// yang bisa mengubah arti query. Nama bertitik (skema.tabel) sengaja tidak
+// diterima supaya aturannya satu dan mudah diperiksa.
+func cekIdentifier(nama string) bool {
+	return reIdentifier.MatchString(nama)
 }
 
 // envStr mengembalikan nilai environment variable, atau def kalau kosong.
