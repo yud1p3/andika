@@ -633,7 +633,7 @@ func (s *Server) handleBaru(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 
-	if _, err := io.WriteString(w, s.renderPesan("pesan-netral",
+	if _, err := io.WriteString(w, s.renderPesan("pesan-baru",
 		"Percakapan baru dimulai. Pertanyaan berikutnya tidak memakai konteks sebelumnya.")); err != nil {
 		log.Printf("web: membalas percakapan baru: %v", err)
 	}

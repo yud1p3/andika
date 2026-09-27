@@ -7,9 +7,17 @@
   sekali — tanpa pesan error apa pun saat build.
 */}}
 
-{{/* Pemberitahuan biasa, misalnya setelah percakapan dikosongkan. */}}
-{{define "pesan-netral"}}
-<p class="not-prose rounded-lg bg-slate-200/70 px-3 py-2 text-sm text-slate-600">{{.}}</p>
+{{/*
+  Pemberitahuan bahwa percakapan sudah dikosongkan.
+
+  id="pesan-baru" dipakai #log untuk menghapus pesan ini begitu kartu
+  pertanyaan berikutnya masuk. Pesannya hanya relevan sampai pertanyaan itu
+  dikirim, dan pertanyaan baru disisipkan dengan beforeend — tanpa dihapus,
+  pengumuman ini menetap selamanya di atas percakapan. Lihat
+  hx-on::after-swap di index.html.
+*/}}
+{{define "pesan-baru"}}
+<p id="pesan-baru" class="not-prose rounded-lg bg-slate-200/70 px-3 py-2 text-sm text-slate-600">{{.}}</p>
 {{end}}
 
 {{/* Jawaban berhenti di tengah jalan. */}}

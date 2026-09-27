@@ -246,6 +246,37 @@ func TestIndexMenyembunyikanPertanyaanContohSetelahDijawab(t *testing.T) {
 	}
 }
 
+// TestIndexMenghapusPesanPercakapanBaruSetelahDijawab menjaga agar pengumuman
+// "Percakapan baru dimulai" tidak menetap di atas percakapan.
+//
+// Pengumuman itu disisipkan sebagai isi #log, sedangkan pertanyaan berikutnya
+// di-append dengan beforeend — jadi tanpa dihapus ia akan bertahan selamanya di
+// atas kartu pertanyaan, padahal maksudnya hanya berlaku sampai pertanyaan itu
+// dikirim.
+//
+// Yang diuji di sini adalah wiring-nya, bukan perilaku peramban: #log harus
+// punya penghalau yang mencari #pesan-baru lalu menghapusnya. Kalau atribut
+// hx-on::after-swap atau id-nya hilang, pengumuman akan menetap tanpa error di
+// mana pun.
+func TestIndexMenghapusPesanPercakapanBaruSetelahDijawab(t *testing.T) {
+	isi := panggil(t, newTestServer(t, alirkanTetap("x")), "/").Body.String()
+
+	pengendali, ok := semuaAtribut(isi, "hx-on::after-swap")
+	if !ok {
+		t.Fatal("tidak ada atribut hx-on::after-swap di halaman")
+	}
+
+	var ketemu bool
+	for _, v := range pengendali {
+		if strings.Contains(v, "pesan-baru") && strings.Contains(v, "remove") {
+			ketemu = true
+		}
+	}
+	if !ketemu {
+		t.Errorf("hx-on::after-swap tidak menghapus #pesan-baru; yang ada: %v", pengendali)
+	}
+}
+
 // semuaAtribut mengumpulkan nilai semua atribut bernama itu di dalam halaman.
 //
 // Berbeda dari ambilAtribut yang berhenti di kemunculan pertama: di sini yang
@@ -910,7 +941,7 @@ func TestKelasAdaDiCSS(t *testing.T) {
 		"blok rujukan":  srv.renderSumber([]string{"Pasal 7", "Lampiran"}),
 		"blok saran":    srv.renderSaran([]string{"Apa syaratnya?", "Berapa lama prosesnya?"}),
 	}
-	for _, nama := range []string{"pesan-netral", "pesan-galat", "pesan-sibuk"} {
+	for _, nama := range []string{"pesan-baru", "pesan-galat", "pesan-sibuk"} {
 		markup[nama] = srv.renderPesan(nama, "teks uji")
 	}
 
@@ -1089,6 +1120,12 @@ func TestPercakapanBaruMengosongkanRiwayat(t *testing.T) {
 	// kosong, sehingga tombolnya akan terasa tidak bekerja.
 	if strings.TrimSpace(rec.Body.String()) == "" {
 		t.Error("balasan POST /baru kosong; htmx tidak akan melakukan swap")
+	}
+
+	// Penanda ini yang dipakai #log untuk menghapus pengumumannya begitu
+	// pertanyaan berikutnya masuk. Tanpa penanda, pengumuman menetap selamanya.
+	if !strings.Contains(rec.Body.String(), `id="pesan-baru"`) {
+		t.Errorf("balasan POST /baru tidak memuat id=pesan-baru: %q", rec.Body.String())
 	}
 
 	panggilDenganCookie(t, srv, "/tanya/alir?q=sesudah+reset", cookie)

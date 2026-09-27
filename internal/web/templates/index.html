@@ -59,20 +59,25 @@
     -->
     <!--
       hx-on::after-swap menyembunyikan tombol pertanyaan contoh begitu ada satu
-      kartu pertanyaan di #log, dan memunculkannya lagi setelah percakapan
-      dikosongkan.
+      kartu pertanyaan di #log, memunculkannya lagi setelah percakapan
+      dikosongkan, dan menghapus pengumuman "Percakapan baru" begitu pertanyaan
+      berikutnya masuk.
 
       Patokannya keberadaan <article>, bukan "apakah #log kosong": balasan
       "Percakapan baru" berupa <p> pengumuman, jadi #log tidak pernah benar-benar
       kosong setelah dipakai. Yang membedakan percakapan baru dari percakapan
       berisi adalah ada tidaknya kartu pertanyaan di dalamnya.
 
+      Pengumuman itu dihapus, bukan dibiarkan, karena pertanyaan baru disisipkan
+      dengan beforeend: tanpa dihapus ia menetap di atas percakapan selamanya,
+      padahal maksudnya hanya berlaku sampai pertanyaan itu dikirim.
+
       Dipasang di #log karena dialah target swap-nya; swap dari SSE di dalam
       kartu ikut menggelembung ke sini, dan itu tidak masalah — syaratnya
-      idempoten.
+      idempoten. Ketiga aksi di bawah idempoten.
     -->
     <main id="log"
-          hx-on::after-swap="document.getElementById('contoh').hidden = this.querySelector('article') !== null"
+          hx-on::after-swap="const mulai = this.querySelector('article') !== null; document.getElementById('contoh').hidden = mulai; if (mulai) { const pesan = this.querySelector('#pesan-baru'); if (pesan) pesan.remove(); }"
           class="min-h-0 flex-1 space-y-4 overflow-y-auto scroll-pb-4 pb-4"></main>
 
     <!--
