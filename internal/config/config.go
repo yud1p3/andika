@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/joho/godotenv"
 )
@@ -19,8 +20,31 @@ type Config struct {
 	// --- Gemini ---
 
 	// GeminiAPIKey wajib diisi. Ambil dari https://aistudio.google.com.
+	//
+	// Kunci ini selalu dibutuhkan, bahkan ketika ChatProvider="openai":
+	// embedding tetap lewat API resmi Google karena antarmuka web Gemini
+	// tidak menyediakan endpoint embedding.
 	GeminiAPIKey string
+	// ChatProvider menentukan backend untuk chat model.
+	//
+	//	"gemini" (default) — API resmi Google, memakai GeminiAPIKey
+	//	"openai"           — endpoint OpenAI-compatible, misalnya proxy
+	//	                     gemini-web2api (lihat ChatBaseURL/ChatAPIKey)
+	//
+	// Hanya chat model yang beralih; embedder tidak terpengaruh.
+	ChatProvider string
+	// ChatBaseURL adalah alamat dasar endpoint OpenAI-compatible, dipakai
+	// hanya ketika ChatProvider="openai". Default menunjuk proxy
+	// gemini-web2api yang berjalan di mesin yang sama.
+	ChatBaseURL string
+	// ChatAPIKey adalah kunci untuk endpoint OpenAI-compatible, dipakai hanya
+	// ketika ChatProvider="openai". Ini kunci lokal proxy (mis. "sk-gemini"),
+	// bukan kunci Google, jadi aman disimpan di .env.
+	ChatAPIKey string
 	// ChatModel adalah LLM yang dipakai untuk menyusun jawaban akhir.
+	//
+	// Ketika ChatProvider="openai", nilainya harus nama model yang dikenali
+	// proxy (mis. "gemini-3.6-flash"), bukan nama model API Google.
 	//
 	// Catatan: nama model Gemini sering berubah dan model lama bisa ditutup
 	// untuk pengguna baru. Notebook pelatihan memakai "gemini-2.5-flash-lite",
@@ -115,6 +139,27 @@ type Config struct {
 	//
 	// Dipakai hanya oleh "rag serve"; "rag ask" tidak menyentuhnya.
 	SaranCount int
+
+	// --- Mode agen (eksperimental) ---
+
+	// AgentMode mengaktifkan jalur agen ReAct sebagai pengganti chain linear.
+	//
+	// Default false: chain linear tetap jalur cepat bawaan. Ketika diaktifkan,
+	// agen memakai tool pencarian untuk memutuskan sendiri langkahnya, dan
+	// chain linear dipasang sebagai cadangan bila agen gagal sebelum
+	// mengeluarkan potongan jawaban pertama.
+	AgentMode bool
+	// AgentMaxStep membatasi jumlah langkah graph agen. Satu panggilan model
+	// atau satu pemanggilan tool dihitung satu langkah. Bila habis, agen
+	// gagal dan permintaan jatuh ke chain linear.
+	//
+	// Default 8 kira-kira cukup untuk baca_pasal -> ikuti_rujukan -> jawab,
+	// sambil menahan loop yang tidak kunjung selesai.
+	AgentMaxStep int
+	// AgentTimeoutSeconds adalah jaring pengaman waktu untuk satu permintaan
+	// di jalur agen. Batas yang sebenarnya adalah AgentMaxStep; nilai ini
+	// hanya mencegah satu permintaan menggantung tanpa batas.
+	AgentTimeoutSeconds int
 }
 
 // Load membaca file .env (kalau ada) lalu environment variable, dan mengisi
@@ -131,6 +176,9 @@ func Load() (*Config, error) {
 
 	cfg := &Config{
 		GeminiAPIKey:     os.Getenv("GEMINI_API_KEY"),
+		ChatProvider:     envStr("CHAT_PROVIDER", "gemini"),
+		ChatBaseURL:      envStr("CHAT_BASE_URL", "http://localhost:8081/v1"),
+		ChatAPIKey:       envStr("CHAT_API_KEY", "sk-gemini"),
 		ChatModel:        envStr("GEMINI_CHAT_MODEL", "gemini-3.5-flash-lite"),
 		EmbedModel:       envStr("GEMINI_EMBED_MODEL", "gemini-embedding-2"),
 		QdrantHost:       envStr("QDRANT_HOST", "localhost"),
@@ -152,6 +200,10 @@ func Load() (*Config, error) {
 		// 3 tombol cukup untuk membuka arah lanjutan tanpa memenuhi layar,
 		// dan tiap saran berarti satu panggilan model tambahan per jawaban.
 		SaranCount: envInt("SARAN_COUNT", 3, &errs),
+
+		AgentMode:           envBool("AGENT_MODE", false, &errs),
+		AgentMaxStep:        envInt("AGENT_MAX_STEP", 8, &errs),
+		AgentTimeoutSeconds: envInt("AGENT_TIMEOUT_SECONDS", 90, &errs),
 	}
 
 	// Jumlah pesan negatif tidak punya arti. Diperlakukan sebagai 0 (memori
@@ -177,12 +229,47 @@ func Load() (*Config, error) {
 			cfg.ChunkStrategy))
 	}
 
+	// Penyedia chat yang tidak dikenal dilaporkan sebagai error, bukan
+	// diam-diam diganti default. Salah ketik di sini berbahaya karena
+	// aplikasi tetap tampak berjalan — hanya saja menembak backend yang
+	// berbeda dari yang dikira, dan hasilnya baru terasa saat kualitas
+	// jawaban menurun.
+	cfg.ChatProvider = strings.ToLower(strings.TrimSpace(cfg.ChatProvider))
+	switch cfg.ChatProvider {
+	case "gemini", "openai":
+	default:
+		errs = append(errs, fmt.Errorf(
+			"CHAT_PROVIDER=%q tidak dikenal; pilih \"gemini\" atau \"openai\"",
+			cfg.ChatProvider))
+	}
+
+	// Endpoint OpenAI-compatible tanpa alamat tidak bisa dihubungi. Ditolak
+	// lebih awal supaya kesalahannya jelas, bukan berupa kegagalan koneksi
+	// yang membingungkan saat permintaan pertama.
+	if cfg.ChatProvider == "openai" && strings.TrimSpace(cfg.ChatBaseURL) == "" {
+		errs = append(errs, errors.New(
+			"CHAT_BASE_URL kosong padahal CHAT_PROVIDER=openai; "+
+				"isi alamat proxy, misalnya http://localhost:8081/v1"))
+	}
+
 	// Ukuran chunk nol atau negatif juga dilaporkan, bukan dibetulkan diam-diam.
 	// Pada strategi "pasal", nilai seperti itu membuat setiap pasal dianggap
 	// perlu dipecah sehingga hasilnya membingungkan tanpa error yang jelas.
 	if cfg.ChunkSize <= 0 {
 		errs = append(errs, fmt.Errorf(
 			"CHUNK_SIZE=%d tidak masuk akal; harus lebih besar dari nol", cfg.ChunkSize))
+	}
+
+	// Batas langkah agen nol atau negatif membuat agen gagal sebelum sempat
+	// memanggil tool mana pun. Lebih baik dilaporkan daripada membingungkan.
+	if cfg.AgentMaxStep < 1 {
+		errs = append(errs, fmt.Errorf(
+			"AGENT_MAX_STEP=%d tidak masuk akal; harus minimal 1", cfg.AgentMaxStep))
+	}
+
+	if cfg.AgentTimeoutSeconds < 1 {
+		errs = append(errs, fmt.Errorf(
+			"AGENT_TIMEOUT_SECONDS=%d tidak masuk akal; harus minimal 1", cfg.AgentTimeoutSeconds))
 	}
 
 	if len(errs) > 0 {
@@ -270,4 +357,28 @@ func envInt(key string, def int, errs *[]error) int {
 // OutputDimensionality yang bertipe *int32.
 func envInt32(key string, def int32, errs *[]error) int32 {
 	return int32(envInt(key, int(def), errs))
+}
+
+// envBool membaca environment variable sebagai boolean. Nilai yang tidak valid
+// dicatat sebagai error dan diganti def, mengikuti pola envInt.
+//
+// Selain "true"/"false" baku, diterima juga "ya"/"tidak" dan "on"/"off" supaya
+// berkas .env berbahasa Indonesia tidak terasa asing. Pencocokan tidak peka
+// huruf besar-kecil dan spasi di ujung diabaikan.
+func envBool(key string, def bool, errs *[]error) bool {
+	raw := strings.TrimSpace(strings.ToLower(os.Getenv(key)))
+	if raw == "" {
+		return def
+	}
+
+	switch raw {
+	case "1", "true", "ya", "yes", "on":
+		return true
+	case "0", "false", "tidak", "no", "off":
+		return false
+	default:
+		*errs = append(*errs, fmt.Errorf(
+			"%s=%q bukan boolean yang valid (pakai true/false)", key, raw))
+		return def
+	}
 }

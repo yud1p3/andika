@@ -20,6 +20,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/cloudwego/eino-ext/components/document/transformer/splitter/recursive"
 	"github.com/cloudwego/eino/components/model"
@@ -135,7 +136,7 @@ func runAsk(ctx context.Context, cfg *config.Config) error {
 	}
 	defer qc.Close()
 
-	chain, err := rag.New(ctx, cfg, ai, qc)
+	penjawab, err := rag.NewPenjawab(ctx, cfg, ai, qc)
 	if err != nil {
 		return err
 	}
@@ -143,6 +144,10 @@ func runAsk(ctx context.Context, cfg *config.Config) error {
 	fmt.Printf("Model: %s | Collection: %s | top-k: %d\n",
 		cfg.ChatModel, cfg.QdrantCollection, cfg.TopK)
 	fmt.Println("Ketik pertanyaan lalu Enter. Keluar dengan 'exit', Ctrl-D, atau Ctrl-C.")
+	if cfg.AgentMode {
+		fmt.Printf("Mode agen aktif (AGENT_MAX_STEP=%d, timeout %d detik).\n",
+			cfg.AgentMaxStep, cfg.AgentTimeoutSeconds)
+	}
 	if cfg.HistoryMessages > 0 {
 		fmt.Printf("Riwayat %d pesan terakhir dipakai untuk memahami rujukan. Ketik 'reset' untuk mengosongkannya.\n",
 			cfg.HistoryMessages)
@@ -213,7 +218,17 @@ func runAsk(ctx context.Context, cfg *config.Config) error {
 		// jawabannya.
 		var sumber []string
 
-		answer, err := chain.Ask(ctx, rag.Pertanyaan{
+		// Jaring pengaman waktu hanya dipasang di mode agen: batas langkah agen
+		// sudah membatasi loop, tetapi satu panggilan model yang menggantung
+		// tetap perlu ada yang memutus. Di jalur linear tidak diperlukan karena
+		// jumlah panggilan modelnya tetap.
+		askCtx := ctx
+		batal := func() {}
+		if cfg.AgentMode {
+			askCtx, batal = context.WithTimeout(ctx, time.Duration(cfg.AgentTimeoutSeconds)*time.Second)
+		}
+
+		answer, err := penjawab.Ask(askCtx, rag.Pertanyaan{
 			Teks: question,
 			// Dipangkas tepat sebelum dikirim, bukan saat disimpan, supaya
 			// mengubah HISTORY_MESSAGES langsung terasa tanpa memulai ulang
@@ -221,6 +236,7 @@ func runAsk(ctx context.Context, cfg *config.Config) error {
 			Riwayat:  rag.PangkasRiwayat(riwayat, cfg.HistoryMessages),
 			OnSumber: func(label []string) { sumber = label },
 		})
+		batal()
 		if err != nil {
 			// Satu pertanyaan gagal tidak perlu menghentikan seluruh sesi.
 			if ctx.Err() != nil {
@@ -394,12 +410,19 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 	}
 	defer qc.Close()
 
-	chain, err := rag.New(ctx, cfg, ai, qc)
+	penjawab, err := rag.NewPenjawab(ctx, cfg, ai, qc)
 	if err != nil {
 		return err
 	}
 
-	srv, err := web.New(alirkanDariChain(chain, ai.ChatModel, cfg.HistoryMessages, cfg.SaranCount), web.Tampilan{
+	// Batas waktu per permintaan hanya berlaku di mode agen; 0 berarti tanpa
+	// batas tambahan.
+	batas := time.Duration(0)
+	if cfg.AgentMode {
+		batas = time.Duration(cfg.AgentTimeoutSeconds) * time.Second
+	}
+
+	srv, err := web.New(alirkanDariPenjawab(penjawab, ai.ChatModel, cfg.HistoryMessages, cfg.SaranCount, batas), web.Tampilan{
 		Title:      cfg.AppTitle,
 		Subtitle:   cfg.AppSubtitle,
 		Model:      cfg.ChatModel,
@@ -413,14 +436,16 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 	return srv.Serve(ctx, *addr)
 }
 
-// alirkanDariChain menyambungkan Chain.Stream ke tipe web.Alirkan.
+// alirkanDariPenjawab menyambungkan Penjawab.Stream ke tipe web.Alirkan.
 //
-// Chain.Stream mengembalikan aliran potongan teks; setiap potongan diteruskan
-// ke delta supaya bisa ditampilkan bertahap di browser.
+// Penjawab.Stream mengembalikan aliran potongan teks; setiap potongan diteruskan
+// ke delta supaya bisa ditampilkan bertahap di browser. Yang dipakai di sini
+// bisa jalur linear maupun agen — keduanya memenuhi kontrak yang sama, dan
+// lapisan web tidak perlu tahu bedanya.
 //
 // Rujukan potongan disalurkan lewat sumber. Callback itu dipasang di
-// rag.Pertanyaan, bukan dipanggil setelah aliran habis, karena chain baru tahu
-// potongan mana yang terpakai setelah node retrieval berjalan — dan itu terjadi
+// rag.Pertanyaan, bukan dipanggil setelah aliran habis, karena jalur baca baru
+// tahu potongan mana yang terpakai setelah retrieval berjalan — dan itu terjadi
 // di tengah aliran, sebelum potongan jawaban pertama tiba.
 //
 // Saran pertanyaan lanjutan disusun model kedua yang mulai bekerja begitu
@@ -428,15 +453,32 @@ func runServe(ctx context.Context, cfg *config.Config, args []string) error {
 // saluran, bukan dikirim lewat callback, karena saran baru siap setelah jawaban
 // habis — lihat web.SaluranSaran.
 //
+// batas adalah jaring pengaman waktu per permintaan; 0 berarti tanpa batas
+// tambahan. Ia hanya membungkus aliran jawaban, bukan penyusunan saran — saran
+// tetap memakai ctx permintaan apa adanya supaya tidak ikut mati saat adapter
+// ini kembali.
+//
 // Fungsi ini sekaligus satu-satunya tempat paket web bertemu tipe Eino:
-// riwayat diterjemahkan dari web.Pesan ke schema.Message sebelum masuk chain.
-func alirkanDariChain(chain *rag.Chain, cm model.BaseChatModel, historyMaks, jumlahSaran int) web.Alirkan {
+// riwayat diterjemahkan dari web.Pesan ke schema.Message sebelum masuk jalur
+// baca.
+func alirkanDariPenjawab(pj rag.Penjawab, cm model.BaseChatModel, historyMaks, jumlahSaran int, batas time.Duration) web.Alirkan {
 	return func(ctx context.Context, pertanyaan string, riwayat []web.Pesan,
 		delta func(string) error, sumber func([]string) error) (web.SaluranSaran, error) {
 
-		mulai, saluran := saranBersamaan(ctx, cm, pertanyaan, jumlahSaran)
+		// Pertanyaan lama ikut diteruskan supaya tombol lanjutan tidak
+		// menawarkan hal yang sudah dijawab pada giliran sebelumnya.
+		mulai, saluran := saranBersamaan(ctx, cm, pertanyaan, jumlahSaran, pertanyaanUser(riwayat))
 
-		sr, err := chain.Stream(ctx, rag.Pertanyaan{
+		alirCtx := ctx
+		if batas > 0 {
+			var batal context.CancelFunc
+			alirCtx, batal = context.WithTimeout(ctx, batas)
+			// Aman memakai defer: seluruh aliran dikuras sampai EOF sebelum
+			// fungsi ini kembali, jadi context hidup selama jawaban mengalir.
+			defer batal()
+		}
+
+		sr, err := pj.Stream(alirCtx, rag.Pertanyaan{
 			Teks:    pertanyaan,
 			Riwayat: rag.PangkasRiwayat(keSchemaMessages(riwayat), historyMaks),
 			// Kesalahan dari sumber diabaikan di sini: yang dilaporkan ke
@@ -480,10 +522,13 @@ func alirkanDariChain(chain *rag.Chain, cm model.BaseChatModel, historyMaks, jum
 // begitu retrieval selesai, dan saluran hasil saran. Keduanya netral terhadap
 // paket web; pemanggil yang memutuskan apa yang dilakukan dengan hasilnya.
 //
+// sudahDitanya berisi pertanyaan yang sudah diajukan di percakapan ini, supaya
+// saran tidak menawarkan hal yang sudah dijawab.
+//
 // Saluran selalu ditutup — baik fitur dimatikan, konteks kosong, maupun model
 // gagal — sehingga pembaca tidak pernah menggantung menunggu isi yang tidak
 // akan datang.
-func saranBersamaan(ctx context.Context, cm model.BaseChatModel, pertanyaan string, jumlah int) (mulai func(string), saluran <-chan []string) {
+func saranBersamaan(ctx context.Context, cm model.BaseChatModel, pertanyaan string, jumlah int, sudahDitanya []string) (mulai func(string), saluran <-chan []string) {
 	// Berbuffer 1 supaya goroutine pengirim tidak pernah memblokir kalau
 	// pemanggil sudah lebih dulu berhenti membaca — misalnya karena jawaban
 	// gagal dan handleAlir langsung menutup koneksi.
@@ -508,7 +553,7 @@ func saranBersamaan(ctx context.Context, cm model.BaseChatModel, pertanyaan stri
 			go func() {
 				defer close(ch)
 
-				hasil, err := rag.Saran(ctx, cm, pertanyaan, konteks, jumlah)
+				hasil, err := rag.Saran(ctx, cm, pertanyaan, konteks, jumlah, sudahDitanya)
 				if err != nil {
 					// Saran hanya tambahan: kegagalannya dicatat, tidak
 					// dilaporkan sebagai kegagalan jawaban.
@@ -541,6 +586,27 @@ func keSchemaMessages(riwayat []web.Pesan) []*schema.Message {
 		msgs = append(msgs, schema.UserMessage(p.Isi))
 	}
 	return msgs
+}
+
+// pertanyaanUser mengumpulkan pertanyaan yang sudah diajukan di percakapan ini,
+// terlama lebih dulu.
+//
+// Dipakai jalur saran supaya tombol lanjutan tidak menawarkan pertanyaan yang
+// sudah dijawab pada giliran sebelumnya. Jawaban tidak ikut diambil: yang
+// menghalangi pengulangan adalah pertanyaannya, bukan jawabannya.
+//
+// Sengaja tidak memakai PangkasRiwayat: batas HISTORY_MESSAGES mengatur berapa
+// banyak konteks yang dikirim ke model jawaban, sedangkan pengulangan saran
+// lebih baik dicegah sepanjang percakapan. Panjang daftarnya toh dibatasi di
+// dalam rag.Saran sebelum dikirim ke model.
+func pertanyaanUser(riwayat []web.Pesan) []string {
+	var out []string
+	for _, p := range riwayat {
+		if p.Peran == web.PeranUser {
+			out = append(out, p.Isi)
+		}
+	}
+	return out
 }
 
 // line adalah satu baris masukan dari stdin, atau error yang muncul saat

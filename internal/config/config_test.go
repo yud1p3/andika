@@ -136,3 +136,177 @@ func TestSaranCountBukanAngkaDilaporkan(t *testing.T) {
 		t.Fatal("Load() berhasil, mau error karena SARAN_COUNT bukan angka")
 	}
 }
+
+// TestAgentModeDefaultFalse mengunci bahwa jalur cepat (chain linear) tetap
+// menjadi bawaan. Agen harus dinyalakan secara sadar.
+func TestAgentModeDefaultFalse(t *testing.T) {
+	t.Setenv("AGENT_MODE", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.AgentMode {
+		t.Error("AgentMode = true, mau false (chain linear tetap bawaan)")
+	}
+}
+
+// TestAgentModeBoolDiterima memastikan bentuk penulisan yang lazim — termasuk
+// "ya" berbahasa Indonesia — dikenali.
+func TestAgentModeBoolDiterima(t *testing.T) {
+	for _, nilai := range []string{"true", "1", "ya", "on", "YES"} {
+		t.Run("AGENT_MODE="+nilai, func(t *testing.T) {
+			t.Setenv("AGENT_MODE", nilai)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() gagal: %v", err)
+			}
+			if !cfg.AgentMode {
+				t.Errorf("AgentMode = false dengan AGENT_MODE=%q, mau true", nilai)
+			}
+		})
+	}
+}
+
+// TestAgentModeBoolTidakValidDilaporkan memastikan nilai yang bukan boolean
+// dilaporkan, bukan diam-diam dianggap mati.
+func TestAgentModeBoolTidakValidDilaporkan(t *testing.T) {
+	t.Setenv("AGENT_MODE", "iya")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() berhasil, mau error karena AGENT_MODE bukan boolean")
+	}
+}
+
+// TestAgentMaxStepTidakMasukAkalDilaporkan menjaga batas loop agen tetap
+// bermakna. Nilai nol membuat agen gagal sebelum memanggil tool apa pun.
+func TestAgentMaxStepTidakMasukAkalDilaporkan(t *testing.T) {
+	for _, nilai := range []string{"0", "-1"} {
+		t.Run("AGENT_MAX_STEP="+nilai, func(t *testing.T) {
+			t.Setenv("AGENT_MAX_STEP", nilai)
+
+			if _, err := Load(); err == nil {
+				t.Fatalf("Load() berhasil dengan AGENT_MAX_STEP=%s, mau error", nilai)
+			}
+		})
+	}
+}
+
+// TestAgentMaxStepDefault mengunci batas langkah bawaan. Nilainya menentukan
+// berapa panggilan model paling banyak yang boleh terjadi per pertanyaan di
+// jalur agen, jadi mengubahnya tanpa sadar mengubah biaya kuota.
+func TestAgentMaxStepDefault(t *testing.T) {
+	t.Setenv("AGENT_MAX_STEP", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.AgentMaxStep != 8 {
+		t.Errorf("AgentMaxStep = %d, mau 8", cfg.AgentMaxStep)
+	}
+}
+
+// TestAgentTimeoutDefault mengunci jaring pengaman waktu bawaan jalur agen.
+func TestAgentTimeoutDefault(t *testing.T) {
+	t.Setenv("AGENT_TIMEOUT_SECONDS", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.AgentTimeoutSeconds != 90 {
+		t.Errorf("AgentTimeoutSeconds = %d, mau 90", cfg.AgentTimeoutSeconds)
+	}
+}
+
+// TestChatProviderDefaultGemini mengunci bahwa API resmi Google tetap menjadi
+// jalur bawaan. Proxy eksperimental harus dipilih secara sadar, supaya
+// pemasangan yang sudah ada tidak diam-diam berubah perilaku setelah upgrade.
+func TestChatProviderDefaultGemini(t *testing.T) {
+	t.Setenv("CHAT_PROVIDER", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.ChatProvider != "gemini" {
+		t.Errorf("ChatProvider = %q, mau %q", cfg.ChatProvider, "gemini")
+	}
+}
+
+// TestChatProviderOpenAIDiterima memastikan nilai yang lazim diketik — beda
+// huruf besar-kecil dan spasi di ujung — tetap dikenali.
+func TestChatProviderOpenAIDiterima(t *testing.T) {
+	for _, nilai := range []string{"openai", "OpenAI", "OPENAI", "  openai  "} {
+		t.Run("CHAT_PROVIDER="+nilai, func(t *testing.T) {
+			t.Setenv("CHAT_PROVIDER", nilai)
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() gagal: %v", err)
+			}
+			if cfg.ChatProvider != "openai" {
+				t.Errorf("ChatProvider = %q dengan CHAT_PROVIDER=%q, mau %q",
+					cfg.ChatProvider, nilai, "openai")
+			}
+		})
+	}
+}
+
+// TestChatProviderTidakDikenalDilaporkan memastikan salah ketik dilaporkan,
+// bukan diam-diam jatuh ke default.
+//
+// Salah ketik yang senyap di sini berbahaya: aplikasi tetap tampak berjalan,
+// hanya saja menembak backend yang berbeda dari yang dikira.
+func TestChatProviderTidakDikenalDilaporkan(t *testing.T) {
+	t.Setenv("CHAT_PROVIDER", "antropik")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() berhasil, mau error karena CHAT_PROVIDER tidak dikenal")
+	}
+}
+
+// TestChatBaseURLDefault mengunci alamat bawaan proxy gemini-web2api.
+func TestChatBaseURLDefault(t *testing.T) {
+	t.Setenv("CHAT_BASE_URL", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.ChatBaseURL != "http://localhost:8081/v1" {
+		t.Errorf("ChatBaseURL = %q, mau %q", cfg.ChatBaseURL, "http://localhost:8081/v1")
+	}
+}
+
+// TestChatBaseURLOpenAITidakBolehKosong menjaga kesalahan konfigurasi
+// tertangkap saat Load, bukan sebagai kegagalan koneksi yang membingungkan
+// saat permintaan pertama.
+//
+// Nilainya berupa spasi, bukan string kosong: envStr memperlakukan string
+// kosong sebagai "tidak diset" dan menggantinya dengan default, sehingga hanya
+// nilai berisi karakter yang benar-benar bisa mengosongkan alamat ini.
+func TestChatBaseURLOpenAITidakBolehKosong(t *testing.T) {
+	t.Setenv("CHAT_PROVIDER", "openai")
+	t.Setenv("CHAT_BASE_URL", "   ")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("Load() berhasil dengan CHAT_BASE_URL kosong, mau error")
+	}
+}
+
+// TestChatAPIKeyDefault mengunci kunci bawaan proxy lokal. Nilainya bukan
+// rahasia Google, jadi aman berada di .env.
+func TestChatAPIKeyDefault(t *testing.T) {
+	t.Setenv("CHAT_API_KEY", "")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() gagal: %v", err)
+	}
+	if cfg.ChatAPIKey != "sk-gemini" {
+		t.Errorf("ChatAPIKey = %q, mau %q", cfg.ChatAPIKey, "sk-gemini")
+	}
+}

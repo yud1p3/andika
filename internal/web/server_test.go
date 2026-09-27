@@ -210,6 +210,42 @@ func TestIndexMenyajikanPertanyaanContoh(t *testing.T) {
 	}
 }
 
+// TestIndexMenyembunyikanPertanyaanContohSetelahDijawab menjaga agar tombol
+// pertanyaan contoh tidak menetap di bawah kotak pencarian setelah percakapan
+// dimulai.
+//
+// Patokannya keberadaan <article> di #log, bukan "apakah #log kosong": balasan
+// "Percakapan baru" berupa <p>, jadi #log tidak pernah benar-benar kosong
+// setelah dipakai. Yang membedakan percakapan baru dari percakapan berisi
+// adalah ada tidaknya kartu pertanyaan.
+//
+// Yang diuji di sini adalah wiring-nya, bukan perilaku peramban: halaman harus
+// memberi wadah tombol sebuah id, dan #log harus punya penghalau yang mencari
+// <article> lalu menyembunyikan wadah itu. Kalau salah satunya hilang, tombol
+// contoh akan menetap selamanya tanpa ada error di mana pun.
+func TestIndexMenyembunyikanPertanyaanContohSetelahDijawab(t *testing.T) {
+	isi := panggil(t, newTestServer(t, alirkanTetap("x")), "/").Body.String()
+
+	if !strings.Contains(isi, `id="contoh"`) {
+		t.Error(`wadah tombol pertanyaan contoh tidak punya id="contoh"`)
+	}
+
+	pengendali, ok := semuaAtribut(isi, "hx-on::after-swap")
+	if !ok {
+		t.Fatal("tidak ada atribut hx-on::after-swap di halaman")
+	}
+
+	var ketemu bool
+	for _, v := range pengendali {
+		if strings.Contains(v, "contoh") && strings.Contains(v, "article") {
+			ketemu = true
+		}
+	}
+	if !ketemu {
+		t.Errorf("hx-on::after-swap tidak menyembunyikan #contoh saat ada <article>; yang ada: %v", pengendali)
+	}
+}
+
 // semuaAtribut mengumpulkan nilai semua atribut bernama itu di dalam halaman.
 //
 // Berbeda dari ambilAtribut yang berhenti di kemunculan pertama: di sini yang

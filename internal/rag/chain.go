@@ -116,6 +116,24 @@ type Chain struct {
 // Ini padanan rangkaian pipe LCEL di notebook, tapi ditulis sebagai graph
 // sehingga setiap tahap bisa dilihat dan diganti satu per satu.
 func New(ctx context.Context, cfg *config.Config, ai *gemini.Client, qc *qdrantclient.Client) (*Chain, error) {
+	ret, err := newRetrieverDasar(ctx, cfg, ai, qc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Dibungkus supaya pertanyaan yang menyebut nomor pasal — "pasal 1
+	// membahas apa" — mengambil seluruh isi pasal itu, bukan hanya potongan
+	// yang kebetulan mirip secara vektor. Lihat retriever.go.
+	return newDenganRetriever(ctx, ai, newRetrieverPasal(ret))
+}
+
+// newRetrieverDasar membuat retriever Qdrant mentah, tanpa pembungkus apa pun.
+//
+// Dipisah dari New supaya jalur agen bisa memakai retriever dasar yang sama
+// untuk tool cari_vektor, sementara jalur linear tetap membungkusnya dengan
+// retrieverPasal. Dua jalur itu memang ingin perilaku retrieval yang berbeda:
+// linear menyaring per pasal otomatis, agen memutuskan sendiri.
+func newRetrieverDasar(ctx context.Context, cfg *config.Config, ai *gemini.Client, qc *qdrantclient.Client) (retriever.Retriever, error) {
 	ret, err := qdrantretriever.NewRetriever(ctx, &qdrantretriever.Config{
 		Client:     qc,
 		Collection: cfg.QdrantCollection,
@@ -128,11 +146,7 @@ func New(ctx context.Context, cfg *config.Config, ai *gemini.Client, qc *qdrantc
 	if err != nil {
 		return nil, fmt.Errorf("membuat retriever Qdrant: %w", err)
 	}
-
-	// Dibungkus supaya pertanyaan yang menyebut nomor pasal — "pasal 1
-	// membahas apa" — mengambil seluruh isi pasal itu, bukan hanya potongan
-	// yang kebetulan mirip secara vektor. Lihat retriever.go.
-	return newDenganRetriever(ctx, ai, newRetrieverPasal(ret))
+	return ret, nil
 }
 
 // newDenganRetriever merakit chain dari retriever yang diberikan.

@@ -67,6 +67,11 @@ berkali-kali tanpa memanggil API embedding lagi.
 Satu tambahan yang tidak ada di notebook: **memori percakapan**. Lihat
 [Memori percakapan](#memori-percakapan).
 
+Diagram di atas menggambarkan **jalur cepat** — chain linear yang jadi bawaan.
+Ada satu jalur baca alternatif: **mode agen** (`AGENT_MODE=true`), di mana model
+memilih sendiri langkah pencariannya lewat tool. Jalur linear tetap dipakai
+sebagai cadangan bila agen gagal. Lihat [Mode agen](#mode-agen-eksperimental).
+
 ---
 
 ## 1. Prasyarat
@@ -122,6 +127,11 @@ cp .env.example .env
 Ambil API key di <https://aistudio.google.com> → **Get API Key**, lalu isi
 `GEMINI_API_KEY` di file `.env`. File `.env` sudah masuk `.gitignore` sehingga
 tidak akan ikut ter-commit.
+
+Kunci ini selalu dipakai untuk embedding. Kalau ingin menghemat kuota chat
+dengan mengalihkan chat model ke proxy lokal, lihat
+[Mode proxy](#mode-proxy-chat-model-opsional) — `GEMINI_API_KEY` tetap
+diperlukan untuk embedding.
 
 ## 4. Menjalankan
 
@@ -423,6 +433,20 @@ terambil** — bukan dari teks jawaban. Dua alasan:
   pertanyaan lanjutan yang diturunkan dari jawaban cenderung mengulang jawaban
   itu alih-alih membuka arah baru.
 
+Daftar pertanyaan yang **sudah diajukan** di percakapan itu ikut disertakan,
+supaya tombol tidak menawarkan lagi hal yang sudah dijawab. Tanpa itu,
+percakapan berlapis cenderung menampilkan saran yang sama berulang kali:
+konteks dokumennya tidak berubah antar-giliran, jadi model pun mengusulkan hal
+yang serupa. Sepuluh pertanyaan terakhir dikirim ke model; penyaringan hasilnya
+memakai seluruh daftar, karena membandingkan teks jauh lebih murah daripada
+mengirimkannya.
+
+Kutipan dokumennya dipotong lebih dulu, pada batas potongan, supaya tidak
+melebihi sekitar 4.000 karakter. Saran hanya butuh gambaran topik — dan di
+[Mode agen](#mode-agen-eksperimental) konteks ini adalah gabungan bukti dari
+semua tool, termasuk yang akhirnya tidak dipakai menjawab, sehingga bisa jauh
+lebih panjang dari yang perlu.
+
 Aliran datanya:
 
 ```
@@ -455,8 +479,8 @@ jawaban, tidak menahan `tutup`, dan tidak menggagalkan handler:
 Keluarannya satu pertanyaan per baris, bukan JSON: JSON yang rusak sedikit saja
 akan mematikan seluruh daftar, sedangkan baris demi baris tetap bisa
 diselamatkan. Penomoran, bullet, tanda kutip di ujung, baris kosong, baris
-pembuka berakhiran titik dua, duplikat, dan pertanyaan pengguna sendiri dibuang
-sebelum ditampilkan.
+pembuka berakhiran titik dua, duplikat, pertanyaan pengguna sendiri, dan
+pertanyaan yang sudah pernah ditanyakan dibuang sebelum ditampilkan.
 
 Tombolnya mengirim pertanyaannya lewat **query string** (`hx-get="/tanya?q=…"`),
 bukan `hx-vals` berisi JSON seperti tombol di halaman utama. Saran berasal dari
@@ -949,6 +973,137 @@ potongan `[pasal]`.
 
 ---
 
+## Mode agen (eksperimental)
+
+Jalur baca bawaan adalah **chain linear**: satu kali penulisan ulang pertanyaan,
+satu kali retrieval, satu kali model menjawab. Jumlah langkahnya tetap dan
+hasilnya bisa diulang persis.
+
+`AGENT_MODE=true` menggantinya dengan **agen ReAct terbatas**: model diberi
+beberapa tool pencarian dan memutuskan sendiri mana yang dipanggil, berapa kali,
+sampai ia merasa cukup untuk menjawab. Jalur linear tidak dihapus — ia tetap
+dirakit dan dipakai sebagai cadangan.
+
+### Cara mengaktifkan
+
+```
+AGENT_MODE=true
+```
+
+Berlaku untuk `rag ask` maupun `rag serve`. Saat aktif, `rag ask` mencetak baris
+penanda; `rag serve` tidak berubah tampilannya.
+
+### Tiga tool
+
+| Tool | Argumen | Dipakai untuk |
+|---|---|---|
+| `cari_vektor` | `query` | pertanyaan bertopik yang tidak menyebut nomor pasal |
+| `baca_pasal` | `nomor` | mengambil seluruh isi satu pasal yang disebut |
+| `ikuti_rujukan` | `nomor` | menelusuri pasal yang dirujuk silang oleh suatu pasal |
+
+Ketiganya mengembalikan potongan beserta label pasalnya, dan potongan yang
+terkumpul dari **semua** tool digabung untuk menyusun rujukan di bawah jawaban
+serta saran pertanyaan lanjutan. Callback-nya tetap menyala sekali, sama seperti
+di jalur linear.
+
+Setiap pemanggilan tool dicatat ke log, sehingga jejak agen bisa dibaca sama
+seperti jalur linear:
+
+```
+rag: tool baca_pasal nomor=145 → 5 potongan
+rag: tool ikuti_rujukan nomor=145 → 7 potongan [Pasal 145 Pasal 25]
+```
+
+### Cadangan ke jalur linear
+
+Agen adalah tambahan, bukan syarat — prinsip yang sama dengan saran pertanyaan
+lanjutan. Bila agen gagal **sebelum** mengeluarkan potongan jawaban pertama
+(kuota habis, batas langkah terlampaui, jawaban kosong), permintaan otomatis
+dijawab ulang lewat chain linear. Kegagalan setelah teks mulai terkirim tidak
+bisa ditarik lagi, jadi diteruskan apa adanya.
+
+### Apa yang berubah dibanding jalur linear
+
+- **Tanpa `condense`.** Riwayat diserahkan apa adanya; agen yang merumuskan
+  query toolnya sendiri. Perilaku giliran lanjutan karena itu bisa berbeda.
+- **Tanpa penyaringan pasal otomatis.** `cari_vektor` sengaja murni kemiripan
+  makna. Filter per-pasal dan penelusuran rujukan yang dulu otomatis kini jadi
+  keputusan model lewat `baca_pasal` dan `ikuti_rujukan`. Ini memang tujuan tool
+  halus, tetapi berarti kualitas bergantung pada pilihan model.
+- **Biaya dan latensi naik.** Satu pertanyaan bisa berarti beberapa panggilan
+  model dan beberapa kali retrieval, bukan satu.
+
+### Pengaman
+
+`AGENT_MAX_STEP` membatasi jumlah langkah; satu panggilan model atau satu
+pemanggilan tool dihitung satu langkah. Bila habis, Eino mengembalikan error
+`exceeds max steps` dan permintaan jatuh ke jalur linear. `AGENT_TIMEOUT_SECONDS`
+adalah jaring pengaman kedua untuk satu permintaan yang menggantung.
+
+Satu batasan yang perlu diketahui: pemeriksa tool-call bawaan Eino berhenti pada
+potongan pertama yang berisi teks. Karena itu instruksi agen melarang menulis
+kalimat pembuka sebelum memanggil tool — model yang menulis basa-basi lebih dulu
+akan mengakhiri putaran tanpa pernah memanggil tool sama sekali.
+
+---
+
+## Mode proxy (chat model opsional)
+
+Chat model bisa dialihkan dari API resmi Google ke endpoint apa pun yang
+kompatibel OpenAI, misalnya [gemini-web2api](../gemini-web2api) — proxy yang
+membungkus antarmuka web Gemini sehingga tidak memerlukan kuota API Google.
+
+```bash
+CHAT_PROVIDER=openai
+CHAT_BASE_URL=http://localhost:8081/v1
+CHAT_API_KEY=sk-gemini
+GEMINI_CHAT_MODEL=gemini-3.6-flash   # nama model versi proxy, bukan API Google
+```
+
+Jalankan proxy-nya lebih dulu (dari folder `gemini-web2api`):
+
+```bash
+python3 gemini_web2api.py
+curl -H "Authorization: Bearer sk-gemini" http://localhost:8081/v1/models
+```
+
+### Embedding tidak ikut beralih
+
+`CHAT_PROVIDER` hanya mengganti **chat model**. Embedder tetap lewat API resmi
+Google, karena antarmuka web Gemini tidak menyediakan endpoint embedding
+(`POST /v1/embeddings` di proxy menjawab 404). Jadi `GEMINI_API_KEY` **tetap
+wajib** — tujuannya menghemat kuota chat, bukan melepas ketergantungan pada
+Google sepenuhnya.
+
+Untuk benar-benar lepas dari `GEMINI_API_KEY`, embedder harus diganti ke
+penyedia lain (mis. Ollama lokal), dan itu berarti **re-index seluruh
+collection**: vector dari model berbeda tidak bisa dibandingkan, jadi data lama
+harus dibuang dan `rag ingest` dijalankan ulang.
+
+### Yang perlu diwaspadai
+
+- **Tool calling lebih rapuh.** Proxy ini bukan memakai function calling asli,
+  melainkan menyuruh model menulis blok ```` ```tool_call ```` lalu mengurainya
+  dengan regex. Di [mode agen](#mode-agen-eksperimental) ini titik paling rawan:
+  agen bergantung pada tool-call yang terstruktur, dan model kadang menjawab
+  langsung tanpa memanggil tool atau mengeluarkan pesan sampah dari antarmuka
+  web. Jalur chain linear lebih aman karena tidak memerlukan tool sama sekali.
+- **Streaming + tool dikirim sebagai satu potongan.** Proxy harus mengurai
+  jawaban penuh dulu untuk menemukan tool-call, jadi waktu tunggu potongan
+  pertama di mode agen bisa berubah.
+- **Tiap permintaan berdiri sendiri.** Multi-turn disimulasikan dengan
+  menempelkan pesan sebelumnya ke prompt, sehingga token yang terpakai lebih
+  banyak daripada API resmi.
+- **Bergantung pada `gemini.google.com` dan bisa terkena rate limit.** Google
+  dapat membatasi permintaan berfrekuensi tinggi.
+- **Bukan API resmi.** Proxy ini hasil rekayasa balik antarmuka web, jadi bisa
+  rusak sewaktu-waktu tanpa pemberitahuan.
+
+Kalau `CHAT_PROVIDER=openai` tetapi proxy belum berjalan, `rag ingest` tetap
+normal (tidak menyentuh chat model); yang gagal hanya `rag ask` dan `rag serve`.
+
+---
+
 ## Padanan notebook → Go
 
 | Sel notebook | Padanan di proyek ini |
@@ -958,6 +1113,7 @@ potongan `[pasal]`.
 | `!curl -o ai_pv.pdf <url>` | `internal/ingest` → `ensureDoc` |
 | Load Dokumen PDF | `internal/ingest` → `loadDoc` (parser dipilih dari ekstensi) |
 | Chunking (`NLTKTextSplitter` / `RecursiveCharacterTextSplitter`) | `internal/ingest` → `splitDocs`; `pasal.go` untuk batas Pasal, `recursive` sebagai cadangan |
+| Chat model | `internal/gemini` → `ChatModel` (backend dipilih lewat `CHAT_PROVIDER`) |
 | Embedding | `internal/gemini` → `DocEmbedder` |
 | Vector Database (`Chroma.from_documents`) | `internal/ingest` → `indexChunks` |
 | Membuat Retriever | `internal/rag` → `New` |
@@ -1201,19 +1357,22 @@ rag-eino/
 ├── internal/
 │   ├── config/config.go         baca .env dan environment variable
 │   ├── gemini/
-│   │   ├── gemini.go            chat model + dua embedder
+│   │   ├── gemini.go            chat model (Gemini / OpenAI-compatible) + dua embedder
 │   │   └── retry.go             pengulangan otomatis saat kuota tercapai
 │   ├── ingest/
 │   │   ├── ingest.go            jalur tulis: siapkan → baca → potong → embed → simpan
 │   │   └── pasal.go             splitter sadar-struktur (batas Pasal/BAB/Lampiran)
 │   ├── rag/
-│   │   ├── chain.go             jalur baca: condense + retriever + prompt + graph
+│   │   ├── chain.go             jalur cepat: condense + retriever + prompt + graph
+│   │   ├── penjawab.go          kontrak jalur baca + pilih jalur + cadangan
+│   │   ├── agent.go             jalur agen: ReAct terbatas dengan tool
+│   │   ├── tools.go             tool agen: cari_vektor, baca_pasal, ikuti_rujukan
 │   │   ├── retriever.go         tambahan: ambil langsung pasal yang disebut,
 │   │   │                        lalu ikuti rujukan silangnya satu lompatan
 │   │   ├── cari.go              retrieval saja, untuk memeriksa hasil pencarian
 │   │   ├── saran.go             saran pertanyaan lanjutan (web saja)
 │   │   ├── sumber.go            label rujukan potongan ("Pasal 7", "Lampiran")
-│   │   └── chain_test.go        verifikasi wiring, streaming, dan memori
+│   │   └── *_test.go            verifikasi wiring, streaming, memori, dan agen
 │   └── web/
 │       ├── server.go            handler HTTP + SSE + sesi percakapan
 │       ├── templates/           halaman, fragmen, dan pesan singkat HTML
@@ -1228,10 +1387,13 @@ Semua pengaturan dibaca dari `.env`. Daftar lengkapnya ada di `.env.example`.
 
 | Variabel | Default | Keterangan |
 |---|---|---|
-| `GEMINI_API_KEY` | — | **wajib** |
-| `GEMINI_CHAT_MODEL` | `gemini-3.5-flash-lite` | model penyusun jawaban |
+| `GEMINI_API_KEY` | — | **wajib**; dipakai chat (kalau `CHAT_PROVIDER=gemini`) dan selalu dipakai embedding |
+| `GEMINI_CHAT_MODEL` | `gemini-3.5-flash-lite` | model penyusun jawaban; ketika `CHAT_PROVIDER=openai`, isi nama model yang dikenali proxy |
 | `GEMINI_EMBED_MODEL` | `gemini-embedding-2` | model embedding |
 | `GEMINI_EMBED_DIM` | `768` | dimensi vector |
+| `CHAT_PROVIDER` | `gemini` | `gemini` = API resmi Google; `openai` = endpoint OpenAI-compatible. Lihat [Mode proxy](#mode-proxy-chat-model-opsional) |
+| `CHAT_BASE_URL` | `http://localhost:8081/v1` | alamat endpoint OpenAI-compatible; hanya dipakai `CHAT_PROVIDER=openai` |
+| `CHAT_API_KEY` | `sk-gemini` | kunci endpoint OpenAI-compatible; hanya dipakai `CHAT_PROVIDER=openai` |
 | `QDRANT_HOST` / `QDRANT_PORT` | `localhost` / `6334` | port gRPC |
 | `QDRANT_COLLECTION` | `pearson_ai` | nama collection |
 | `DOC_PATH` | `data/ai_pv.pdf` | berkas dokumen sumber; `.pdf` di-parse sebagai PDF, selebihnya dibaca sebagai teks |
@@ -1244,6 +1406,9 @@ Semua pengaturan dibaca dari `.env`. Daftar lengkapnya ada di `.env.example`.
 | `TOP_K` | `10` | jumlah chunk yang diambil |
 | `HISTORY_MESSAGES` | `6` | jumlah pesan riwayat percakapan yang disertakan; `0` mematikan memori |
 | `SARAN_COUNT` | `3` | jumlah tombol saran pertanyaan lanjutan di client web; `0` mematikan fitur. Tidak dipakai `rag ask` |
+| `AGENT_MODE` | `false` | `true` mengganti jalur baca menjadi agen ReAct; `false` memakai chain linear. Lihat [Mode agen](#mode-agen-eksperimental) |
+| `AGENT_MAX_STEP` | `8` | batas langkah agen (satu panggilan model atau satu tool = satu langkah) |
+| `AGENT_TIMEOUT_SECONDS` | `90` | jaring pengaman waktu per permintaan di jalur agen |
 
 ### Mengganti dokumen
 

@@ -10,6 +10,7 @@ require (
 	github.com/cloudwego/eino-ext/components/embedding/gemini v0.0.0-20260924074145-3603a39473c3
 	github.com/cloudwego/eino-ext/components/indexer/qdrant v0.0.0-20260924074145-3603a39473c3
 	github.com/cloudwego/eino-ext/components/model/gemini v0.1.36
+	github.com/cloudwego/eino-ext/components/model/openai v0.1.13
 	github.com/cloudwego/eino-ext/components/retriever/qdrant v0.0.0-20260924074145-3603a39473c3
 	github.com/google/uuid v1.6.0
 	github.com/joho/godotenv v1.5.1
@@ -29,8 +30,10 @@ require (
 	github.com/bytedance/sonic/loader v0.5.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudwego/base64x v0.1.6 // indirect
+	github.com/cloudwego/eino-ext/libs/acl/openai v0.1.17 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/eino-contrib/jsonschema v1.0.3 // indirect
+	github.com/evanphx/json-patch v0.5.2 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -44,6 +47,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.9 // indirect
 	github.com/ledongthuc/pdf v0.0.0-20250511090121-5959a4027728 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
+	github.com/meguminnnnnnnnn/go-openai v0.1.2 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/nikolalohinski/gonja v1.5.3 // indirect

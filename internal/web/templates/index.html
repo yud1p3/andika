@@ -57,7 +57,22 @@
       scroll-pb-4 adalah jarak yang disisakan saat htmx menggulirkan jawaban
       terbaru ke bawah (lihat show:bottom di formulir dan di fragmen).
     -->
+    <!--
+      hx-on::after-swap menyembunyikan tombol pertanyaan contoh begitu ada satu
+      kartu pertanyaan di #log, dan memunculkannya lagi setelah percakapan
+      dikosongkan.
+
+      Patokannya keberadaan <article>, bukan "apakah #log kosong": balasan
+      "Percakapan baru" berupa <p> pengumuman, jadi #log tidak pernah benar-benar
+      kosong setelah dipakai. Yang membedakan percakapan baru dari percakapan
+      berisi adalah ada tidaknya kartu pertanyaan di dalamnya.
+
+      Dipasang di #log karena dialah target swap-nya; swap dari SSE di dalam
+      kartu ikut menggelembung ke sini, dan itu tidak masalah — syaratnya
+      idempoten.
+    -->
     <main id="log"
+          hx-on::after-swap="document.getElementById('contoh').hidden = this.querySelector('article') !== null"
           class="min-h-0 flex-1 space-y-4 overflow-y-auto scroll-pb-4 pb-4"></main>
 
     <!--
@@ -99,8 +114,11 @@
       Tombol ini berada di dalam formulir supaya ikut kena hx-disabled-elt
       ("find button"): selama jawaban masih mengalir, semuanya mati, dan
       permintaan yang saling menimpa tidak mungkin terjadi.
+
+      id="contoh" dipakai #log untuk menyembunyikan seluruh baris ini setelah
+      percakapan dimulai — lihat hx-on::after-swap di atas.
     -->
-    <div class="mt-3 flex flex-wrap gap-1.5">
+    <div id="contoh" class="mt-3 flex flex-wrap gap-1.5">
       <button type="button"
               hx-get="/tanya"
               hx-vals='{"q":"Jenis naskah dinas apa saja?"}'
