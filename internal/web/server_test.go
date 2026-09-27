@@ -823,6 +823,25 @@ func TestPasalMengembalikanIsi(t *testing.T) {
 	}
 }
 
+// TestPasalTidakMengulangPenanda menjaga panel tidak mencetak "Pasal N" dua
+// kali.
+//
+// Isi potongan sudah membawa penandanya sendiri, jadi judul panel hanya akan
+// mengulanginya tepat di atasnya. Itulah yang dulu terjadi: chip "Pasal 7" di
+// baris rujukan, lalu judul panel "Pasal 7", lalu isi yang juga mulai dengan
+// "Pasal 7".
+func TestPasalTidakMengulangPenanda(t *testing.T) {
+	srv := newTestServer(t, alirkanTetap("x"))
+
+	isi := srv.renderPasal([]string{
+		"Pasal 7 Jenis Naskah Dinas sebagaimana dimaksud dalam Pasal 4 huruf a terdiri atas:",
+	})
+
+	if n := strings.Count(isi, "Pasal 7"); n != 1 {
+		t.Errorf("penanda \"Pasal 7\" muncul %d kali, mau 1:\n%s", n, isi)
+	}
+}
+
 // TestPasalNomorTidakSahDitolak menjaga nomor dari query string tidak pernah
 // diteruskan mentah-mentah.
 func TestPasalNomorTidakSahDitolak(t *testing.T) {
@@ -1071,7 +1090,7 @@ func TestKelasAdaDiCSS(t *testing.T) {
 		"halaman utama": panggil(t, srv, "/").Body.String(),
 		"blok rujukan":  srv.renderSumber([]string{"Pasal 7", "Lampiran"}),
 		"blok saran":    srv.renderSaran([]string{"Apa syaratnya?", "Berapa lama prosesnya?"}),
-		"isi pasal":     srv.renderPasal("7", []string{"Pasal 7 isi uji."}),
+		"isi pasal":     srv.renderPasal([]string{"Pasal 7 isi uji."}),
 		"pasal kosong":  srv.renderPasalKosong("Pasal 7 tidak ditemukan."),
 	}
 	for _, nama := range []string{"pesan-baru", "pesan-galat", "pesan-sibuk"} {

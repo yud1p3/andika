@@ -172,8 +172,11 @@ type dataTanya struct {
 }
 
 // dataPasal adalah isi fragmen untuk isi lengkap satu pasal.
+//
+// Tidak ada medan nomor: setiap potongan sudah membawa penandanya sendiri di
+// awal teksnya — pasal pendek dari teks aslinya, pasal panjang dari header
+// ingest — sehingga judul panel hanya akan mengulanginya tepat di atasnya.
 type dataPasal struct {
-	Nomor string
 	// Potongan sudah berupa HTML hasil render Markdown, jadi tipenya
 	// template.HTML supaya html/template tidak meng-escape-nya untuk kedua
 	// kalinya.
@@ -546,7 +549,7 @@ func (s *Server) handlePasal(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tulis(s.renderPasal(nomor, potongan))
+	tulis(s.renderPasal(potongan))
 }
 
 // handleAlir mengalirkan jawaban sebagai Server-Sent Events.
@@ -785,7 +788,7 @@ func (s *Server) renderSumber(sumber []string) string {
 // datang sebagai Markdown hasil konversi, lengkap dengan daftar bernomor — lalu
 // hasilnya diserahkan ke template. Markup pembungkusnya tetap di template supaya
 // kelas Tailwind-nya ikut ter-build.
-func (s *Server) renderPasal(nomor string, potongan []string) string {
+func (s *Server) renderPasal(potongan []string) string {
 	bagian := make([]template.HTML, 0, len(potongan))
 	for _, p := range potongan {
 		bagian = append(bagian, template.HTML(s.renderMarkdown(p)))
@@ -793,7 +796,7 @@ func (s *Server) renderPasal(nomor string, potongan []string) string {
 
 	var b strings.Builder
 
-	if err := s.tmpl.ExecuteTemplate(&b, "pasal", dataPasal{Nomor: nomor, Potongan: bagian}); err != nil {
+	if err := s.tmpl.ExecuteTemplate(&b, "pasal", dataPasal{Potongan: bagian}); err != nil {
 		log.Printf("web: merender pasal: %v", err)
 		return ""
 	}

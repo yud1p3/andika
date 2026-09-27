@@ -440,6 +440,11 @@ Label rujukan yang berbentuk nomor pasal — "Pasal 7" — adalah tombol. Klik-n
 memuat isi lengkap pasal itu dan menampilkannya di panel kecil di bawah baris
 rujukan, di kartu jawaban yang sama. Klik pasal lain mengganti isi panel itu.
 
+Panelnya sengaja tanpa judul sendiri. Setiap potongan sudah membawa penanda
+pasalnya di awal teks — pasal pendek dari teks aslinya ("Pasal 7 Jenis Naskah
+Dinas…"), pasal panjang dari header ingest ("Pasal 89 ayat (1), bagian 1/2") —
+jadi judul panel hanya akan mengulanginya tepat di atasnya.
+
 Label yang bukan pasal — "Lampiran", "Pembukaan", "Dokumen" — tetap label biasa:
 tidak ada nomor yang bisa diambil untuknya.
 

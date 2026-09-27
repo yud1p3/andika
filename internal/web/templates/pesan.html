@@ -76,12 +76,16 @@
   Isi lengkap satu pasal, hasil tombol rujukan yang diklik.
 
   Potongan sudah berupa HTML hasil render Markdown (server yang merendernya),
-  jadi di sini tinggal dibungkus. Judul kecilnya menegaskan pasal mana yang
-  sedang dibaca, karena wadahnya bisa tergantikan oleh klik pasal lain.
+  jadi di sini tinggal dibungkus.
+
+  Sengaja tanpa judul "Pasal N" sendiri. Setiap potongan sudah membawa penanda
+  itu di awal teksnya — pasal pendek dari teks aslinya, pasal panjang dari
+  header ingest ("Pasal 89 ayat (1), bagian 1/2") — sehingga judul panel hanya
+  akan mengulanginya tepat di atasnya. Yang menandai pasal mana yang sedang
+  dibaca cukup chip tombol di baris rujukan tepat di atas panel ini.
 */}}
 {{define "pasal"}}
 <div class="not-prose mt-2 rounded-lg border border-slate-200 bg-slate-50 p-3">
-  <p class="mb-2 text-xs font-semibold text-slate-500">Pasal {{.Nomor}}</p>
   {{range .Potongan}}<div class="prose prose-slate prose-sm max-w-none">{{.}}</div>
   {{end}}
 </div>
